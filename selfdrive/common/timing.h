@@ -1,8 +1,7 @@
-#ifndef COMMON_TIMING_H
-#define COMMON_TIMING_H
+#pragma once
 
-#include <stdint.h>
-#include <time.h>
+#include <cstdint>
+#include <ctime>
 
 #ifdef __APPLE__
 #define CLOCK_BOOTTIME CLOCK_MONOTONIC
@@ -23,7 +22,7 @@ static inline double millis_since_boot() {
 static inline double seconds_since_boot() {
   struct timespec t;
   clock_gettime(CLOCK_BOOTTIME, &t);
-  return (double)t.tv_sec + t.tv_nsec * 1e-9;;
+  return (double)t.tv_sec + t.tv_nsec * 1e-9;
 }
 
 static inline uint64_t nanos_since_epoch() {
@@ -50,5 +49,3 @@ static inline uint64_t nanos_monotonic_raw() {
   clock_gettime(CLOCK_MONOTONIC_RAW, &t);
   return t.tv_sec * 1000000000ULL + t.tv_nsec;
 }
-
-#endif

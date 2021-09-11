@@ -1,676 +1,582 @@
-#include <stdio.h>
-#include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
-#include <signal.h>
-#include <unistd.h>
 #include <sched.h>
-#include <sys/time.h>
 #include <sys/cdefs.h>
-#include <sys/types.h>
-#include <sys/time.h>
 #include <sys/resource.h>
-
-#include <assert.h>
-#include <pthread.h>
-
-#include <zmq.h>
-#include <libusb-1.0/libusb.h>
-
-#include <capnp/serialize.h>
-#include "cereal/gen/cpp/log.capnp.h"
-#include "cereal/gen/cpp/car.capnp.h"
-
-#include "common/messaging.h"
-#include "common/params.h"
-#include "common/swaglog.h"
-#include "common/timing.h"
+#include <sys/types.h>
+#include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
+#include <bitset>
+#include <cassert>
+#include <cerrno>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <thread>
+#include <unordered_map>
 
-// double the FIFO size
-#define RECV_SIZE (0x1000)
-#define TIMEOUT 0
+#include <libusb-1.0/libusb.h>
 
-#define SAFETY_NOOUTPUT  0
-#define SAFETY_HONDA 1
-#define SAFETY_TOYOTA 2
-#define SAFETY_GM 3
-#define SAFETY_HONDA_BOSCH 4
-#define SAFETY_FORD 5
-#define SAFETY_CADILLAC 6
-#define SAFETY_HYUNDAI 7
-#define SAFETY_TESLA 8
-#define SAFETY_CHRYSLER 9
-#define SAFETY_SUBARU 10
-#define SAFETY_TOYOTA_IPAS 0x1335
-#define SAFETY_TOYOTA_NOLIMITS 0x1336
-#define SAFETY_ALLOUTPUT 0x1337
-#define SAFETY_ELM327 0xE327     // diagnostic only
+#include "cereal/gen/cpp/car.capnp.h"
+#include "cereal/messaging/messaging.h"
+#include "selfdrive/common/params.h"
+#include "selfdrive/common/swaglog.h"
+#include "selfdrive/common/timing.h"
+#include "selfdrive/common/util.h"
+#include "selfdrive/hardware/hw.h"
+#include "selfdrive/locationd/ublox_msg.h"
 
-namespace {
+#include "selfdrive/boardd/panda.h"
+#include "selfdrive/boardd/pigeon.h"
 
-volatile int do_exit = 0;
+#define MAX_IR_POWER 0.5f
+#define MIN_IR_POWER 0.0f
+#define CUTOFF_IL 200
+#define SATURATE_IL 1600
+#define NIBBLE_TO_HEX(n) ((n) < 10 ? (n) + '0' : ((n) - 10) + 'a')
 
-libusb_context *ctx = NULL;
-libusb_device_handle *dev_handle;
-pthread_mutex_t usb_lock;
+std::atomic<bool> safety_setter_thread_running(false);
+std::atomic<bool> ignition(false);
 
-bool spoofing_started = false;
-bool fake_send = false;
-bool loopback_can = false;
-bool is_grey_panda = false;
+ExitHandler do_exit;
 
-pthread_t safety_setter_thread_handle = -1;
-pthread_t pigeon_thread_handle = -1;
-bool pigeon_needs_init;
+void safety_setter_thread(Panda *panda) {
+  LOGD("Starting safety setter thread");
+  // diagnostic only is the default, needed for VIN query
+  panda->set_safety_model(cereal::CarParams::SafetyModel::ELM327);
 
-void pigeon_init();
-void *pigeon_thread(void *crap);
+  Params p = Params();
 
-void *safety_setter_thread(void *s) {
-  char *value;
-  size_t value_sz = 0;
+  // switch to SILENT when CarVin param is read
+  while (true) {
+    if (do_exit || !panda->connected) {
+      safety_setter_thread_running = false;
+      return;
+    };
 
+    std::string value_vin = p.get("CarVin");
+    if (value_vin.size() > 0) {
+      // sanity check VIN format
+      assert(value_vin.size() == 17);
+      LOGW("got CarVin %s", value_vin.c_str());
+      break;
+    }
+    util::sleep_for(100);
+  }
+
+  // VIN query done, stop listening to OBDII
+  panda->set_safety_model(cereal::CarParams::SafetyModel::ELM327, 1);
+
+  std::string params;
   LOGW("waiting for params to set safety model");
-  while (1) {
-    if (do_exit) return NULL;
+  while (true) {
+    if (do_exit || !panda->connected) {
+      safety_setter_thread_running = false;
+      return;
+    };
 
-    const int result = read_db_value(NULL, "CarParams", &value, &value_sz);
-    if (value_sz > 0) break;
-    usleep(100*1000);
+    if (p.getBool("ControlsReady")) {
+      params = p.get("CarParams");
+      if (params.size() > 0) break;
+    }
+    util::sleep_for(100);
   }
-  LOGW("got %d bytes CarParams", value_sz);
+  LOGW("got %d bytes CarParams", params.size());
 
-  // format for board, make copy due to alignment issues, will be freed on out of scope
-  auto amsg = kj::heapArray<capnp::word>((value_sz / sizeof(capnp::word)) + 1);
-  memcpy(amsg.begin(), value, value_sz);
-  free(value);
-
-  capnp::FlatArrayMessageReader cmsg(amsg);
+  AlignedBuffer aligned_buf;
+  capnp::FlatArrayMessageReader cmsg(aligned_buf.align(params.data(), params.size()));
   cereal::CarParams::Reader car_params = cmsg.getRoot<cereal::CarParams>();
+  cereal::CarParams::SafetyModel safety_model = car_params.getSafetyModel();
 
-  auto safety_model = car_params.getSafetyModel();
+  panda->set_unsafe_mode(0);  // see safety_declarations.h for allowed values
+
   auto safety_param = car_params.getSafetyParam();
-  LOGW("setting safety model: %d with param %d", safety_model, safety_param);
+  LOGW("setting safety model: %d with param %d", (int)safety_model, safety_param);
 
-  int safety_setting = 0;
-  switch (safety_model) {
-  case cereal::CarParams::SafetyModel::NO_OUTPUT:
-    safety_setting = SAFETY_NOOUTPUT;
-    break;
-  case cereal::CarParams::SafetyModel::HONDA:
-    safety_setting = SAFETY_HONDA;
-    break;
-  case cereal::CarParams::SafetyModel::TOYOTA:
-    safety_setting = SAFETY_TOYOTA;
-    break;
-  case cereal::CarParams::SafetyModel::ELM327:
-    safety_setting = SAFETY_ELM327;
-    break;
-  case cereal::CarParams::SafetyModel::GM:
-    safety_setting = SAFETY_GM;
-    break;
-  case cereal::CarParams::SafetyModel::HONDA_BOSCH:
-    safety_setting = SAFETY_HONDA_BOSCH;
-    break;
-  case cereal::CarParams::SafetyModel::FORD:
-    safety_setting = SAFETY_FORD;
-    break;
-  case cereal::CarParams::SafetyModel::CADILLAC:
-    safety_setting = SAFETY_CADILLAC;
-    break;
-  case cereal::CarParams::SafetyModel::HYUNDAI:
-    safety_setting = SAFETY_HYUNDAI;
-    break;
-  case cereal::CarParams::SafetyModel::CHRYSLER:
-    safety_setting = SAFETY_CHRYSLER;
-    break;
-  case cereal::CarParams::SafetyModel::SUBARU:
-    safety_setting = SAFETY_SUBARU;
-    break;
-  default:
-    LOGE("unknown safety model: %d", safety_model);
+  panda->set_safety_model(safety_model, safety_param);
+
+  safety_setter_thread_running = false;
+}
+
+
+Panda *usb_connect() {
+  std::unique_ptr<Panda> panda;
+  try {
+    panda = std::make_unique<Panda>();
+  } catch (std::exception &e) {
+    return nullptr;
   }
 
-  pthread_mutex_lock(&usb_lock);
+  Params params = Params();
 
-  // set in the mutex to avoid race
-  safety_setter_thread_handle = -1;
+  if (getenv("BOARDD_LOOPBACK")) {
+    panda->set_loopback(true);
+  }
 
-  // set if long_control is allowed by openpilot. Hardcoded to True for now
-  libusb_control_transfer(dev_handle, 0x40, 0xdf, 1, 0, NULL, 0, TIMEOUT);
+  if (auto fw_sig = panda->get_firmware_version(); fw_sig) {
+    params.put("PandaFirmware", (const char *)fw_sig->data(), fw_sig->size());
 
-  libusb_control_transfer(dev_handle, 0x40, 0xdc, safety_setting, safety_param, NULL, 0, TIMEOUT);
+    // Convert to hex for offroad
+    char fw_sig_hex_buf[16] = {0};
+    const uint8_t *fw_sig_buf = fw_sig->data();
+    for (size_t i = 0; i < 8; i++) {
+      fw_sig_hex_buf[2*i] = NIBBLE_TO_HEX((uint8_t)fw_sig_buf[i] >> 4);
+      fw_sig_hex_buf[2*i+1] = NIBBLE_TO_HEX((uint8_t)fw_sig_buf[i] & 0xF);
+    }
 
-  pthread_mutex_unlock(&usb_lock);
+    params.put("PandaFirmwareHex", fw_sig_hex_buf, 16);
+    LOGW("fw signature: %.*s", 16, fw_sig_hex_buf);
+  } else { return nullptr; }
 
-  return NULL;
+  // get panda serial
+  if (auto serial = panda->get_serial(); serial) {
+    params.put("PandaDongleId", serial->c_str(), serial->length());
+    LOGW("panda serial: %s", serial->c_str());
+  } else { return nullptr; }
+
+  // power on charging, only the first time. Panda can also change mode and it causes a brief disconneciton
+#ifndef __x86_64__
+  static std::once_flag connected_once;
+  std::call_once(connected_once, &Panda::set_usb_power_mode, panda, cereal::PandaState::UsbPowerMode::CDP);
+#endif
+
+  if (panda->has_rtc) {
+    setenv("TZ","UTC",1);
+    struct tm sys_time = util::get_time();
+    struct tm rtc_time = panda->get_rtc();
+
+    if (!util::time_valid(sys_time) && util::time_valid(rtc_time)) {
+      LOGE("System time wrong, setting from RTC. "
+           "System: %d-%02d-%02d %02d:%02d:%02d RTC: %d-%02d-%02d %02d:%02d:%02d",
+           sys_time.tm_year + 1900, sys_time.tm_mon + 1, sys_time.tm_mday,
+           sys_time.tm_hour, sys_time.tm_min, sys_time.tm_sec,
+           rtc_time.tm_year + 1900, rtc_time.tm_mon + 1, rtc_time.tm_mday,
+           rtc_time.tm_hour, rtc_time.tm_min, rtc_time.tm_sec);
+
+      const struct timeval tv = {mktime(&rtc_time), 0};
+      settimeofday(&tv, 0);
+    }
+  }
+
+  return panda.release();
 }
 
 // must be called before threads or with mutex
-bool usb_connect() {
-  int err;
-  unsigned char is_pigeon[1] = {0};
-
-  dev_handle = libusb_open_device_with_vid_pid(ctx, 0xbbaa, 0xddcc);
-  if (dev_handle == NULL) { goto fail; }
-
-  err = libusb_set_configuration(dev_handle, 1);
-  if (err != 0) { goto fail; }
-
-  err = libusb_claim_interface(dev_handle, 0);
-  if (err != 0) { goto fail; }
-
-  if (loopback_can) {
-    libusb_control_transfer(dev_handle, 0xc0, 0xe5, 1, 0, NULL, 0, TIMEOUT);
-  }
-
-  // power off ESP
-  libusb_control_transfer(dev_handle, 0xc0, 0xd9, 0, 0, NULL, 0, TIMEOUT);
-
-  // power on charging (may trigger a reconnection, should be okay)
-  #ifndef __x86_64__
-    libusb_control_transfer(dev_handle, 0xc0, 0xe6, 1, 0, NULL, 0, TIMEOUT);
-  #else
-    LOGW("not enabling charging on x86_64");
-  #endif
-
-  // diagnostic only is the default, needed for VIN query
-  libusb_control_transfer(dev_handle, 0x40, 0xdc, SAFETY_ELM327, 0, NULL, 0, TIMEOUT);
-
-  if (safety_setter_thread_handle == -1) {
-    err = pthread_create(&safety_setter_thread_handle, NULL, safety_setter_thread, NULL);
-    assert(err == 0);
-  }
-
-  libusb_control_transfer(dev_handle, 0xc0, 0xc1, 0, 0, is_pigeon, 1, TIMEOUT);
-
-  if (is_pigeon[0]) {
-    LOGW("grey panda detected");
-    is_grey_panda = true;
-    pigeon_needs_init = true;
-    if (pigeon_thread_handle == -1) {
-      err = pthread_create(&pigeon_thread_handle, NULL, pigeon_thread, NULL);
-      assert(err == 0);
+static Panda *usb_retry_connect() {
+  LOGW("attempting to connect");
+  while (!do_exit) {
+    Panda *panda = usb_connect();
+    if (panda) {
+      LOGW("connected to board");
+      return panda;
     }
-  }
-
-  return true;
-fail:
-  return false;
+    util::sleep_for(100); 
+  };
+  return nullptr;
 }
 
-void usb_retry_connect() {
-  LOG("attempting to connect");
-  while (!usb_connect()) { usleep(100*1000); }
-  LOGW("connected to board");
+void can_recv(Panda *panda, PubMaster &pm) {
+  kj::Array<capnp::word> can_data;
+  panda->can_receive(can_data);
+  auto bytes = can_data.asBytes();
+  pm.send("can", bytes.begin(), bytes.size());
 }
 
-void handle_usb_issue(int err, const char func[]) {
-  LOGE_100("usb error %d \"%s\" in %s", err, libusb_strerror((enum libusb_error)err), func);
-  if (err == -4) {
-    LOGE("lost connection");
-    usb_retry_connect();
-  }
-  // TODO: check other errors, is simply retrying okay?
-}
-
-void can_recv(void *s) {
-  int err;
-  uint32_t data[RECV_SIZE/4];
-  int recv;
-  uint32_t f1, f2;
-
-  uint64_t start_time = nanos_since_boot();
-
-  // do recv
-  pthread_mutex_lock(&usb_lock);
-
-  do {
-    err = libusb_bulk_transfer(dev_handle, 0x81, (uint8_t*)data, RECV_SIZE, &recv, TIMEOUT);
-    if (err != 0) { handle_usb_issue(err, __func__); }
-    if (err == -8) { LOGE_100("overflow got 0x%x", recv); };
-
-    // timeout is okay to exit, recv still happened
-    if (err == -7) { break; }
-  } while(err != 0);
-
-  pthread_mutex_unlock(&usb_lock);
-
-  // return if length is 0
-  if (recv <= 0) {
-    return;
-  }
-
-  // create message
-  capnp::MallocMessageBuilder msg;
-  cereal::Event::Builder event = msg.initRoot<cereal::Event>();
-  event.setLogMonoTime(start_time);
-  size_t num_msg = recv / 0x10;
-
-  auto canData = event.initCan(num_msg);
-
-  // populate message
-  for (int i = 0; i < num_msg; i++) {
-    if (data[i*4] & 4) {
-      // extended
-      canData[i].setAddress(data[i*4] >> 3);
-      //printf("got extended: %x\n", data[i*4] >> 3);
-    } else {
-      // normal
-      canData[i].setAddress(data[i*4] >> 21);
-    }
-    canData[i].setBusTime(data[i*4+1] >> 16);
-    int len = data[i*4+1]&0xF;
-    canData[i].setDat(kj::arrayPtr((uint8_t*)&data[i*4+2], len));
-    canData[i].setSrc((data[i*4+1] >> 4) & 0xff);
-  }
-
-  // send to can
-  auto words = capnp::messageToFlatArray(msg);
-  auto bytes = words.asBytes();
-  zmq_send(s, bytes.begin(), bytes.size(), 0);
-}
-
-void can_health(void *s) {
-  int cnt;
-
-  // copied from board/main.c
-  struct __attribute__((packed)) health {
-    uint32_t voltage;
-    uint32_t current;
-    uint8_t started;
-    uint8_t controls_allowed;
-    uint8_t gas_interceptor_detected;
-    uint8_t started_signal_detected;
-    uint8_t started_alt;
-  } health;
-
-  // recv from board
-  pthread_mutex_lock(&usb_lock);
-
-  do {
-    cnt = libusb_control_transfer(dev_handle, 0xc0, 0xd2, 0, 0, (unsigned char*)&health, sizeof(health), TIMEOUT);
-    if (cnt != sizeof(health)) { handle_usb_issue(cnt, __func__); }
-  } while(cnt != sizeof(health));
-
-  pthread_mutex_unlock(&usb_lock);
-
-  // create message
-  capnp::MallocMessageBuilder msg;
-  cereal::Event::Builder event = msg.initRoot<cereal::Event>();
-  event.setLogMonoTime(nanos_since_boot());
-  auto healthData = event.initHealth();
-
-  // set fields
-  healthData.setVoltage(health.voltage);
-  healthData.setCurrent(health.current);
-  if (spoofing_started) {
-    healthData.setStarted(1);
-  } else {
-    healthData.setStarted(health.started);
-  }
-  healthData.setControlsAllowed(health.controls_allowed);
-  healthData.setGasInterceptorDetected(health.gas_interceptor_detected);
-  healthData.setStartedSignalDetected(health.started_signal_detected);
-  healthData.setIsGreyPanda(is_grey_panda);
-
-  // send to health
-  auto words = capnp::messageToFlatArray(msg);
-  auto bytes = words.asBytes();
-  zmq_send(s, bytes.begin(), bytes.size(), 0);
-}
-
-
-void can_send(void *s) {
-  int err;
-
-  // recv from sendcan
-  zmq_msg_t msg;
-  zmq_msg_init(&msg);
-  err = zmq_msg_recv(&msg, s, 0);
-  assert(err >= 0);
-
-  // format for board, make copy due to alignment issues, will be freed on out of scope
-  auto amsg = kj::heapArray<capnp::word>((zmq_msg_size(&msg) / sizeof(capnp::word)) + 1);
-  memcpy(amsg.begin(), zmq_msg_data(&msg), zmq_msg_size(&msg));
-
-  capnp::FlatArrayMessageReader cmsg(amsg);
-  cereal::Event::Reader event = cmsg.getRoot<cereal::Event>();
-  if (nanos_since_boot() - event.getLogMonoTime() > 1e9) {
-    //Older than 1 second. Dont send.
-    zmq_msg_close(&msg);
-    return;
-  }
-  int msg_count = event.getCan().size();
-
-  uint32_t *send = (uint32_t*)malloc(msg_count*0x10);
-  memset(send, 0, msg_count*0x10);
-
-  for (int i = 0; i < msg_count; i++) {
-    auto cmsg = event.getSendcan()[i];
-    if (cmsg.getAddress() >= 0x800) {
-      // extended
-      send[i*4] = (cmsg.getAddress() << 3) | 5;
-    } else {
-      // normal
-      send[i*4] = (cmsg.getAddress() << 21) | 1;
-    }
-    assert(cmsg.getDat().size() <= 8);
-    send[i*4+1] = cmsg.getDat().size() | (cmsg.getSrc() << 4);
-    memcpy(&send[i*4+2], cmsg.getDat().begin(), cmsg.getDat().size());
-  }
-
-  // release msg
-  zmq_msg_close(&msg);
-
-  // send to board
-  int sent;
-  pthread_mutex_lock(&usb_lock);
-
-  if (!fake_send) {
-    do {
-      err = libusb_bulk_transfer(dev_handle, 3, (uint8_t*)send, msg_count*0x10, &sent, TIMEOUT);
-      if (err != 0 || msg_count*0x10 != sent) { handle_usb_issue(err, __func__); }
-    } while(err != 0);
-  }
-
-  pthread_mutex_unlock(&usb_lock);
-
-  // done
-  free(send);
-}
-
-// **** threads ****
-
-void *can_send_thread(void *crap) {
+void can_send_thread(Panda *panda, bool fake_send) {
   LOGD("start send thread");
 
-  // sendcan = 8017
-  void *context = zmq_ctx_new();
-  void *subscriber = sub_sock(context, "tcp://127.0.0.1:8017");
-
-  // drain sendcan to delete any stale messages from previous runs
-  zmq_msg_t msg;
-  zmq_msg_init(&msg);
-  int err = 0;
-  while(err >= 0) {
-    err = zmq_msg_recv(&msg, subscriber, ZMQ_DONTWAIT);
-  }
+  AlignedBuffer aligned_buf;
+  Context * context = Context::create();
+  SubSocket * subscriber = SubSocket::create(context, "sendcan");
+  assert(subscriber != NULL);
+  subscriber->setTimeout(100);
 
   // run as fast as messages come in
-  while (!do_exit) {
-    can_send(subscriber);
+  while (!do_exit && panda->connected) {
+    Message * msg = subscriber->receive();
+
+    if (!msg) {
+      if (errno == EINTR) {
+        do_exit = true;
+      }
+      continue;
+    }
+
+    capnp::FlatArrayMessageReader cmsg(aligned_buf.align(msg));
+    cereal::Event::Reader event = cmsg.getRoot<cereal::Event>();
+
+    //Dont send if older than 1 second
+    if (nanos_since_boot() - event.getLogMonoTime() < 1e9) {
+      if (!fake_send) {
+        panda->can_send(event.getSendcan());
+      }
+    }
+
+    delete msg;
   }
-  return NULL;
+
+  delete subscriber;
+  delete context;
 }
 
-void *can_recv_thread(void *crap) {
+void can_recv_thread(Panda *panda) {
   LOGD("start recv thread");
 
   // can = 8006
-  void *context = zmq_ctx_new();
-  void *publisher = zmq_socket(context, ZMQ_PUB);
-  zmq_bind(publisher, "tcp://*:8006");
+  PubMaster pm({"can"});
 
   // run at 100hz
   const uint64_t dt = 10000000ULL;
   uint64_t next_frame_time = nanos_since_boot() + dt;
 
-  while (!do_exit) {
-    can_recv(publisher);
+  while (!do_exit && panda->connected) {
+    can_recv(panda, pm);
 
     uint64_t cur_time = nanos_since_boot();
     int64_t remaining = next_frame_time - cur_time;
-    if (remaining > 0){
-      useconds_t sleep = remaining / 1000;
-      usleep(sleep);
+    if (remaining > 0) {
+      std::this_thread::sleep_for(std::chrono::nanoseconds(remaining));
     } else {
-      LOGW("missed cycle");
+      if (ignition) {
+        LOGW("missed cycles (%d) %lld", (int)-1*remaining/dt, remaining);
+      }
       next_frame_time = cur_time;
     }
 
     next_frame_time += dt;
   }
-  return NULL;
 }
 
-void *can_health_thread(void *crap) {
-  LOGD("start health thread");
+void panda_state_thread(Panda *&panda, bool spoofing_started) {
+  LOGD("start panda state thread");
+  PubMaster pm({"pandaState"});
 
-  // health = 8011
-  void *context = zmq_ctx_new();
-  void *publisher = zmq_socket(context, ZMQ_PUB);
-  zmq_bind(publisher, "tcp://*:8011");
+  uint32_t no_ignition_cnt = 0;
+  bool ignition_last = false;
+  Params params = Params();
 
-  // run at 1hz
-  while (!do_exit) {
-    can_health(publisher);
-    usleep(1000*1000);
+  // Broadcast empty pandaState message when panda is not yet connected
+  while (!do_exit && !panda) {
+    MessageBuilder msg;
+    auto pandaState  = msg.initEvent().initPandaState();
+
+    pandaState.setPandaType(cereal::PandaState::PandaType::UNKNOWN);
+    pm.send("pandaState", msg);
+    util::sleep_for(500);
   }
-  return NULL;
-}
 
-#define pigeon_send(x) _pigeon_send(x, sizeof(x)-1)
+  // run at 2hz
+  while (!do_exit && panda->connected) {
+    health_t pandaState = panda->get_state();
 
-void hexdump(unsigned char *d, int l) {
-  for (int i = 0; i < l; i++) {
-    if (i!=0 && i%0x10 == 0) printf("\n");
-    printf("%2.2X ", d[i]);
-  }
-  printf("\n");
-}
-
-void _pigeon_send(const char *dat, int len) {
-  int sent;
-  unsigned char a[0x20];
-  int err;
-  a[0] = 1;
-  for (int i=0; i<len; i+=0x20) {
-    int ll = std::min(0x20, len-i);
-    memcpy(&a[1], &dat[i], ll);
-    pthread_mutex_lock(&usb_lock);
-    err = libusb_bulk_transfer(dev_handle, 2, a, ll+1, &sent, TIMEOUT);
-    if (err < 0) { handle_usb_issue(err, __func__); }
-    /*assert(err == 0);
-    assert(sent == ll+1);*/
-    //hexdump(a, ll+1);
-    pthread_mutex_unlock(&usb_lock);
-  }
-}
-
-void pigeon_set_power(int power) {
-  pthread_mutex_lock(&usb_lock);
-  int err = libusb_control_transfer(dev_handle, 0xc0, 0xd9, power, 0, NULL, 0, TIMEOUT);
-  if (err < 0) { handle_usb_issue(err, __func__); }
-  pthread_mutex_unlock(&usb_lock);
-}
-
-void pigeon_set_baud(int baud) {
-  int err;
-  pthread_mutex_lock(&usb_lock);
-  err = libusb_control_transfer(dev_handle, 0xc0, 0xe2, 1, 0, NULL, 0, TIMEOUT);
-  if (err < 0) { handle_usb_issue(err, __func__); }
-  err = libusb_control_transfer(dev_handle, 0xc0, 0xe4, 1, baud/300, NULL, 0, TIMEOUT);
-  if (err < 0) { handle_usb_issue(err, __func__); }
-  pthread_mutex_unlock(&usb_lock);
-}
-
-void pigeon_init() {
-  usleep(1000*1000);
-  LOGW("grey panda start");
-
-  // power off pigeon
-  pigeon_set_power(0);
-  usleep(100*1000);
-
-  // 9600 baud at init
-  pigeon_set_baud(9600);
-
-  // power on pigeon
-  pigeon_set_power(1);
-  usleep(500*1000);
-
-  // baud rate upping
-  pigeon_send("\x24\x50\x55\x42\x58\x2C\x34\x31\x2C\x31\x2C\x30\x30\x30\x37\x2C\x30\x30\x30\x33\x2C\x34\x36\x30\x38\x30\x30\x2C\x30\x2A\x31\x35\x0D\x0A");
-  usleep(100*1000);
-
-  // set baud rate to 460800
-  pigeon_set_baud(460800);
-  usleep(100*1000);
-
-  // init from ubloxd
-  pigeon_send("\xB5\x62\x06\x00\x14\x00\x03\xFF\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x01\x00\x00\x00\x00\x00\x1E\x7F");
-  pigeon_send("\xB5\x62\x06\x3E\x00\x00\x44\xD2");
-  pigeon_send("\xB5\x62\x06\x00\x14\x00\x00\xFF\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x19\x35");
-  pigeon_send("\xB5\x62\x06\x00\x14\x00\x01\x00\x00\x00\xC0\x08\x00\x00\x00\x08\x07\x00\x01\x00\x01\x00\x00\x00\x00\x00\xF4\x80");
-  pigeon_send("\xB5\x62\x06\x00\x14\x00\x04\xFF\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x1D\x85");
-  pigeon_send("\xB5\x62\x06\x00\x00\x00\x06\x18");
-  pigeon_send("\xB5\x62\x06\x00\x01\x00\x01\x08\x22");
-  pigeon_send("\xB5\x62\x06\x00\x01\x00\x02\x09\x23");
-  pigeon_send("\xB5\x62\x06\x00\x01\x00\x03\x0A\x24");
-  pigeon_send("\xB5\x62\x06\x08\x06\x00\x64\x00\x01\x00\x00\x00\x79\x10");
-  pigeon_send("\xB5\x62\x06\x24\x24\x00\x05\x00\x04\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x5A\x63");
-  pigeon_send("\xB5\x62\x06\x1E\x14\x00\x00\x00\x00\x00\x01\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x3C\x37");
-  pigeon_send("\xB5\x62\x06\x24\x00\x00\x2A\x84");
-  pigeon_send("\xB5\x62\x06\x23\x00\x00\x29\x81");
-  pigeon_send("\xB5\x62\x06\x1E\x00\x00\x24\x72");
-  pigeon_send("\xB5\x62\x06\x01\x03\x00\x01\x07\x01\x13\x51");
-  pigeon_send("\xB5\x62\x06\x01\x03\x00\x02\x15\x01\x22\x70");
-  pigeon_send("\xB5\x62\x06\x01\x03\x00\x02\x13\x01\x20\x6C");
-
-  LOGW("grey panda is ready to fly");
-}
-
-static void pigeon_publish_raw(void *publisher, unsigned char *dat, int alen) {
-  // create message
-  capnp::MallocMessageBuilder msg;
-  cereal::Event::Builder event = msg.initRoot<cereal::Event>();
-  event.setLogMonoTime(nanos_since_boot());
-  auto ublox_raw = event.initUbloxRaw(alen);
-  memcpy(ublox_raw.begin(), dat, alen);
-
-  // send to ubloxRaw
-  auto words = capnp::messageToFlatArray(msg);
-  auto bytes = words.asBytes();
-  zmq_send(publisher, bytes.begin(), bytes.size(), 0);
-}
-
-
-void *pigeon_thread(void *crap) {
-  // ubloxRaw = 8042
-  void *context = zmq_ctx_new();
-  void *publisher = zmq_socket(context, ZMQ_PUB);
-  zmq_bind(publisher, "tcp://*:8042");
-
-  // run at ~100hz
-  unsigned char dat[0x1000];
-  uint64_t cnt = 0;
-  while (!do_exit) {
-    if (pigeon_needs_init) {
-      pigeon_needs_init = false;
-      pigeon_init();
+    if (spoofing_started) {
+      pandaState.ignition_line = 1;
     }
-    int alen = 0;
-    while (alen < 0xfc0) {
-      pthread_mutex_lock(&usb_lock);
-      int len = libusb_control_transfer(dev_handle, 0xc0, 0xe0, 1, 0, dat+alen, 0x40, TIMEOUT);
-      if (len < 0) { handle_usb_issue(len, __func__); }
-      pthread_mutex_unlock(&usb_lock);
-      if (len <= 0) break;
 
-      //printf("got %d\n", len);
-      alen += len;
+    // Make sure CAN buses are live: safety_setter_thread does not work if Panda CAN are silent and there is only one other CAN node
+    if (pandaState.safety_model == (uint8_t)(cereal::CarParams::SafetyModel::SILENT)) {
+      panda->set_safety_model(cereal::CarParams::SafetyModel::NO_OUTPUT);
     }
-    if (alen > 0) {
-      if (dat[0] == (char)0x00){
-        LOGW("received invalid ublox message, resetting pigeon");
-        pigeon_init();
+
+    ignition = ((pandaState.ignition_line != 0) || (pandaState.ignition_can != 0));
+
+    if (ignition) {
+      no_ignition_cnt = 0;
+    } else {
+      no_ignition_cnt += 1;
+    }
+
+#ifndef __x86_64__
+    bool power_save_desired = !ignition;
+    if (pandaState.power_save_enabled != power_save_desired) {
+      panda->set_power_saving(power_save_desired);
+    }
+
+    // set safety mode to NO_OUTPUT when car is off. ELM327 is an alternative if we want to leverage athenad/connect
+    if (!ignition && (pandaState.safety_model != (uint8_t)(cereal::CarParams::SafetyModel::NO_OUTPUT))) {
+      panda->set_safety_model(cereal::CarParams::SafetyModel::NO_OUTPUT);
+    }
+#endif
+
+    // clear VIN, CarParams, and set new safety on car start
+    if (ignition && !ignition_last) {
+      params.clearAll(CLEAR_ON_IGNITION_ON);
+
+      if (!safety_setter_thread_running) {
+        safety_setter_thread_running = true;
+        std::thread(safety_setter_thread, panda).detach();
       } else {
-        pigeon_publish_raw(publisher, dat, alen);
+        LOGW("Safety setter thread already running");
+      }
+    } else if (!ignition && ignition_last) {
+      params.clearAll(CLEAR_ON_IGNITION_OFF);
+    }
+
+    // Write to rtc once per minute when no ignition present
+    if ((panda->has_rtc) && !ignition && (no_ignition_cnt % 120 == 1)) {
+      // Write time to RTC if it looks reasonable
+      setenv("TZ","UTC",1);
+      struct tm sys_time = util::get_time();
+
+      if (util::time_valid(sys_time)) {
+        struct tm rtc_time = panda->get_rtc();
+        double seconds = difftime(mktime(&rtc_time), mktime(&sys_time));
+
+        if (std::abs(seconds) > 1.1) {
+          panda->set_rtc(sys_time);
+          LOGW("Updating panda RTC. dt = %.2f "
+               "System: %d-%02d-%02d %02d:%02d:%02d RTC: %d-%02d-%02d %02d:%02d:%02d",
+               seconds,
+               sys_time.tm_year + 1900, sys_time.tm_mon + 1, sys_time.tm_mday,
+               sys_time.tm_hour, sys_time.tm_min, sys_time.tm_sec,
+               rtc_time.tm_year + 1900, rtc_time.tm_mon + 1, rtc_time.tm_mday,
+               rtc_time.tm_hour, rtc_time.tm_min, rtc_time.tm_sec);
+        }
       }
     }
 
-    // 10ms
-    usleep(10*1000);
+    ignition_last = ignition;
+    uint16_t fan_speed_rpm = panda->get_fan_speed();
+
+    // build msg
+    MessageBuilder msg;
+    auto evt = msg.initEvent();
+    evt.setValid(panda->comms_healthy);
+
+    auto ps = evt.initPandaState();
+    ps.setUptime(pandaState.uptime);
+
+    if (Hardware::TICI()) {
+      double read_time = millis_since_boot();
+      ps.setVoltage(std::atoi(util::read_file("/sys/class/hwmon/hwmon1/in1_input").c_str()));
+      ps.setCurrent(std::atoi(util::read_file("/sys/class/hwmon/hwmon1/curr1_input").c_str()));
+      read_time = millis_since_boot() - read_time;
+      if (read_time > 50) {
+        LOGW("reading hwmon took %lfms", read_time);
+      }
+    } else {
+      ps.setVoltage(pandaState.voltage);
+      ps.setCurrent(pandaState.current);
+    }
+
+    ps.setIgnitionLine(pandaState.ignition_line);
+    ps.setIgnitionCan(pandaState.ignition_can);
+    ps.setControlsAllowed(pandaState.controls_allowed);
+    ps.setGasInterceptorDetected(pandaState.gas_interceptor_detected);
+    ps.setHasGps(true);
+    ps.setCanRxErrs(pandaState.can_rx_errs);
+    ps.setCanSendErrs(pandaState.can_send_errs);
+    ps.setCanFwdErrs(pandaState.can_fwd_errs);
+    ps.setGmlanSendErrs(pandaState.gmlan_send_errs);
+    ps.setPandaType(panda->hw_type);
+    ps.setUsbPowerMode(cereal::PandaState::UsbPowerMode(pandaState.usb_power_mode));
+    ps.setSafetyModel(cereal::CarParams::SafetyModel(pandaState.safety_model));
+    ps.setSafetyParam(pandaState.safety_param);
+    ps.setFanSpeedRpm(fan_speed_rpm);
+    ps.setFaultStatus(cereal::PandaState::FaultStatus(pandaState.fault_status));
+    ps.setPowerSaveEnabled((bool)(pandaState.power_save_enabled));
+    ps.setHeartbeatLost((bool)(pandaState.heartbeat_lost));
+    ps.setHarnessStatus(cereal::PandaState::HarnessStatus(pandaState.car_harness_status));
+
+    // Convert faults bitset to capnp list
+    std::bitset<sizeof(pandaState.faults) * 8> fault_bits(pandaState.faults);
+    auto faults = ps.initFaults(fault_bits.count());
+
+    size_t i = 0;
+    for (size_t f = size_t(cereal::PandaState::FaultType::RELAY_MALFUNCTION);
+        f <= size_t(cereal::PandaState::FaultType::INTERRUPT_RATE_TICK); f++) {
+      if (fault_bits.test(f)) {
+        faults.set(i, cereal::PandaState::FaultType(f));
+        i++;
+      }
+    }
+    pm.send("pandaState", msg);
+    panda->send_heartbeat();
+    util::sleep_for(500);
+  }
+}
+
+void hardware_control_thread(Panda *panda) {
+  LOGD("start hardware control thread");
+  SubMaster sm({"deviceState", "driverCameraState"});
+
+  uint64_t last_front_frame_t = 0;
+  uint16_t prev_fan_speed = 999;
+  uint16_t ir_pwr = 0;
+  uint16_t prev_ir_pwr = 999;
+  bool prev_charging_disabled = false;
+  unsigned int cnt = 0;
+
+  FirstOrderFilter integ_lines_filter(0, 30.0, 0.05);
+
+  while (!do_exit && panda->connected) {
     cnt++;
+    sm.update(1000); // TODO: what happens if EINTR is sent while in sm.update?
+
+    if (!Hardware::PC() && sm.updated("deviceState")) {
+      // Charging mode
+      bool charging_disabled = sm["deviceState"].getDeviceState().getChargingDisabled();
+      if (charging_disabled != prev_charging_disabled) {
+        if (charging_disabled) {
+          panda->set_usb_power_mode(cereal::PandaState::UsbPowerMode::CLIENT);
+          LOGW("TURN OFF CHARGING!\n");
+        } else {
+          panda->set_usb_power_mode(cereal::PandaState::UsbPowerMode::CDP);
+          LOGW("TURN ON CHARGING!\n");
+        }
+        prev_charging_disabled = charging_disabled;
+      }
+    }
+
+    // Other pandas don't have fan/IR to control
+    if (panda->hw_type != cereal::PandaState::PandaType::UNO && panda->hw_type != cereal::PandaState::PandaType::DOS) continue;
+    if (sm.updated("deviceState")) {
+      // Fan speed
+      uint16_t fan_speed = sm["deviceState"].getDeviceState().getFanSpeedPercentDesired();
+      if (fan_speed != prev_fan_speed || cnt % 100 == 0) {
+        panda->set_fan_speed(fan_speed);
+        prev_fan_speed = fan_speed;
+      }
+    }
+    if (sm.updated("driverCameraState")) {
+      auto event = sm["driverCameraState"];
+      int cur_integ_lines = event.getDriverCameraState().getIntegLines();
+      float cur_gain = event.getDriverCameraState().getGain();
+
+      if (Hardware::TICI()) {
+        cur_integ_lines = integ_lines_filter.update(cur_integ_lines * cur_gain);
+      }
+      last_front_frame_t = event.getLogMonoTime();
+
+      if (cur_integ_lines <= CUTOFF_IL) {
+        ir_pwr = 100.0 * MIN_IR_POWER;
+      } else if (cur_integ_lines > SATURATE_IL) {
+        ir_pwr = 100.0 * MAX_IR_POWER;
+      } else {
+        ir_pwr = 100.0 * (MIN_IR_POWER + ((cur_integ_lines - CUTOFF_IL) * (MAX_IR_POWER - MIN_IR_POWER) / (SATURATE_IL - CUTOFF_IL)));
+      }
+    }
+    // Disable ir_pwr on front frame timeout
+    uint64_t cur_t = nanos_since_boot();
+    if (cur_t - last_front_frame_t > 1e9) {
+      ir_pwr = 0;
+    }
+
+    if (ir_pwr != prev_ir_pwr || cnt % 100 == 0 || ir_pwr >= 50.0) {
+      panda->set_ir_pwr(ir_pwr);
+      prev_ir_pwr = ir_pwr;
+    }
+
+  }
+}
+
+static void pigeon_publish_raw(PubMaster &pm, const std::string &dat) {
+  // create message
+  MessageBuilder msg;
+  msg.initEvent().setUbloxRaw(capnp::Data::Reader((uint8_t*)dat.data(), dat.length()));
+  pm.send("ubloxRaw", msg);
+}
+
+void pigeon_thread(Panda *panda) {
+  PubMaster pm({"ubloxRaw"});
+  bool ignition_last = false;
+
+  Pigeon *pigeon = Hardware::TICI() ? Pigeon::connect("/dev/ttyHS0") : Pigeon::connect(panda);
+
+  std::unordered_map<char, uint64_t> last_recv_time;
+  std::unordered_map<char, int64_t> cls_max_dt = {
+    {(char)ublox::CLASS_NAV, int64_t(900000000ULL)}, // 0.9s
+    {(char)ublox::CLASS_RXM, int64_t(900000000ULL)}, // 0.9s
+  };
+
+  while (!do_exit && panda->connected) {
+    bool need_reset = false;
+    std::string recv = pigeon->receive();
+
+    // Parse message header
+    if (ignition && recv.length() >= 3) {
+      if (recv[0] == (char)ublox::PREAMBLE1 && recv[1] == (char)ublox::PREAMBLE2) {
+        const char msg_cls = recv[2];
+        uint64_t t = nanos_since_boot();
+        if (t > last_recv_time[msg_cls]) {
+          last_recv_time[msg_cls] = t;
+        }
+      }
+    }
+
+    // Check based on message frequency
+    for (const auto& [msg_cls, max_dt] : cls_max_dt) {
+      int64_t dt = (int64_t)nanos_since_boot() - (int64_t)last_recv_time[msg_cls];
+      if (ignition_last && ignition && dt > max_dt) {
+        LOG("ublox receive timeout, msg class: 0x%02x, dt %llu", msg_cls, dt);
+        // TODO: turn on reset after verification of logs
+        // need_reset = true;
+      }
+    }
+
+    // Check based on null bytes
+    if (ignition && recv.length() > 0 && recv[0] == (char)0x00) {
+      need_reset = true;
+      LOGW("received invalid ublox message while onroad, resetting panda GPS");
+    }
+
+    if (recv.length() > 0) {
+      pigeon_publish_raw(pm, recv);
+    }
+
+    // init pigeon on rising ignition edge
+    // since it was turned off in low power mode
+    if((ignition && !ignition_last) || need_reset) {
+      pigeon->init();
+
+      // Set receive times to current time
+      uint64_t t = nanos_since_boot() + 10000000000ULL; // Give ublox 10 seconds to start
+      for (const auto& [msg_cls, dt] : cls_max_dt) {
+        last_recv_time[msg_cls] = t;
+      }
+    } else if (!ignition && ignition_last) {
+      // power off on falling edge of ignition
+      LOGD("powering off pigeon\n");
+      pigeon->stop();
+      pigeon->set_power(false);
+    }
+
+    ignition_last = ignition;
+
+    // 10ms - 100 Hz
+    util::sleep_for(10);
   }
 
-  return NULL;
-}
-
-int set_realtime_priority(int level) {
-  // should match python using chrt
-  struct sched_param sa;
-  memset(&sa, 0, sizeof(sa));
-  sa.sched_priority = level;
-  return sched_setscheduler(getpid(), SCHED_FIFO, &sa);
-}
-
+  delete pigeon;
 }
 
 int main() {
-  int err;
   LOGW("starting boardd");
 
-  // set process priority
-  err = set_realtime_priority(4);
-  LOG("setpriority returns %d", err);
+  // set process priority and affinity
+  int err = set_realtime_priority(54);
+  LOG("set priority returns %d", err);
 
-  // check the environment
-  if (getenv("STARTED")) {
-    spoofing_started = true;
+  err = set_core_affinity(Hardware::TICI() ? 4 : 3);
+  LOG("set affinity returns %d", err);
+
+  while (!do_exit) {
+    Panda *panda = nullptr;
+    std::vector<std::thread> threads;
+    threads.emplace_back(panda_state_thread, std::ref(panda), getenv("STARTED") != nullptr);
+
+    // connect to the board
+    panda = usb_retry_connect();
+    if (panda != nullptr) {
+      threads.emplace_back(can_send_thread, panda, getenv("FAKESEND") != nullptr);
+      threads.emplace_back(can_recv_thread, panda);
+      threads.emplace_back(hardware_control_thread, panda);
+      threads.emplace_back(pigeon_thread, panda);
+    }
+
+    for (auto &t : threads) t.join();
+
+    delete panda;
+    panda = nullptr;
   }
-
-  if (getenv("FAKESEND")) {
-    fake_send = true;
-  }
-
-  if (getenv("BOARDD_LOOPBACK")){
-    loopback_can = true;
-  }
-
-  // init libusb
-  err = libusb_init(&ctx);
-  assert(err == 0);
-  libusb_set_debug(ctx, 3);
-
-  // connect to the board
-  usb_retry_connect();
-
-
-  // create threads
-  pthread_t can_health_thread_handle;
-  err = pthread_create(&can_health_thread_handle, NULL,
-                       can_health_thread, NULL);
-  assert(err == 0);
-
-  pthread_t can_send_thread_handle;
-  err = pthread_create(&can_send_thread_handle, NULL,
-                       can_send_thread, NULL);
-  assert(err == 0);
-
-  pthread_t can_recv_thread_handle;
-  err = pthread_create(&can_recv_thread_handle, NULL,
-                       can_recv_thread, NULL);
-  assert(err == 0);
-
-  // join threads
-
-  err = pthread_join(can_recv_thread_handle, NULL);
-  assert(err == 0);
-
-  err = pthread_join(can_send_thread_handle, NULL);
-  assert(err == 0);
-
-  err = pthread_join(can_health_thread_handle, NULL);
-  assert(err == 0);
-
-  //while (!do_exit) usleep(1000);
-
-  // destruct libusb
-
-  libusb_close(dev_handle);
-  libusb_exit(ctx);
 }

@@ -10,7 +10,7 @@ WARN_FLAGS = -Werror=implicit-function-declaration \
              -Werror=format-extra-args
 
 CFLAGS = -std=gnu11 -g -fPIC -O2 $(WARN_FLAGS)
-CXXFLAGS = -std=c++11 -g -fPIC -O2 $(WARN_FLAGS)
+CXXFLAGS = -std=c++1z -g -fPIC -O2 $(WARN_FLAGS)
 
 CURL_FLAGS = -I$(PHONELIBS)/curl/include
 CURL_LIBS = $(PHONELIBS)/curl/lib/libcurl.a \
@@ -31,7 +31,10 @@ FRAMEBUFFER_LIBS = -lutils -lgui -lEGL
 .PHONY: all
 all: updater
 
-OBJS = courbd.ttf.o \
+OBJS = opensans_regular.ttf.o \
+			 opensans_semibold.ttf.o \
+			 opensans_bold.ttf.o \
+       ../../selfdrive/common/util.o \
        ../../selfdrive/common/touch.o \
        ../../selfdrive/common/framebuffer.o \
        $(PHONELIBS)/json11/json11.o \
@@ -50,7 +53,15 @@ updater: updater.o $(OBJS)
     -lcutils -lm -llog
 	strip updater
 
-courbd.ttf.o: ../../selfdrive/assets/courbd.ttf
+opensans_regular.ttf.o: ../../selfdrive/assets/fonts/opensans_regular.ttf
+	@echo "[ bin2o ] $@"
+	cd '$(dir $<)' && ld -r -b binary '$(notdir $<)' -o '$(abspath $@)'
+
+opensans_bold.ttf.o: ../../selfdrive/assets/fonts/opensans_bold.ttf
+	@echo "[ bin2o ] $@"
+	cd '$(dir $<)' && ld -r -b binary '$(notdir $<)' -o '$(abspath $@)'
+
+opensans_semibold.ttf.o: ../../selfdrive/assets/fonts/opensans_semibold.ttf
 	@echo "[ bin2o ] $@"
 	cd '$(dir $<)' && ld -r -b binary '$(notdir $<)' -o '$(abspath $@)'
 

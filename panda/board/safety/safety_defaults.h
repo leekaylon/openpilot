@@ -1,16 +1,20 @@
-void default_rx_hook(CAN_FIFOMailBox_TypeDef *to_push) {
-  UNUSED(to_push);
-}
+const addr_checks default_rx_checks = {
+  .check = NULL,
+  .len = 0,
+};
 
-int default_ign_hook(void) {
-  return -1; // use GPIO to determine ignition
+int default_rx_hook(CAN_FIFOMailBox_TypeDef *to_push) {
+  UNUSED(to_push);
+  return true;
 }
 
 // *** no output safety mode ***
 
-static void nooutput_init(int16_t param) {
+static const addr_checks* nooutput_init(int16_t param) {
   UNUSED(param);
-  controls_allowed = 0;
+  controls_allowed = false;
+  relay_malfunction_reset();
+  return &default_rx_checks;
 }
 
 static int nooutput_tx_hook(CAN_FIFOMailBox_TypeDef *to_send) {
@@ -36,15 +40,16 @@ const safety_hooks nooutput_hooks = {
   .rx = default_rx_hook,
   .tx = nooutput_tx_hook,
   .tx_lin = nooutput_tx_lin_hook,
-  .ignition = default_ign_hook,
   .fwd = default_fwd_hook,
 };
 
 // *** all output safety mode ***
 
-static void alloutput_init(int16_t param) {
+static const addr_checks* alloutput_init(int16_t param) {
   UNUSED(param);
-  controls_allowed = 1;
+  controls_allowed = true;
+  relay_malfunction_reset();
+  return &default_rx_checks;
 }
 
 static int alloutput_tx_hook(CAN_FIFOMailBox_TypeDef *to_send) {
@@ -64,6 +69,5 @@ const safety_hooks alloutput_hooks = {
   .rx = default_rx_hook,
   .tx = alloutput_tx_hook,
   .tx_lin = alloutput_tx_lin_hook,
-  .ignition = default_ign_hook,
   .fwd = default_fwd_hook,
 };
