@@ -1,48 +1,150 @@
-#ifndef COMMON_UTIL_H
-#define COMMON_UTIL_H
+#pragma once
 
-#include <stdio.h>
+#include <fcntl.h>
+#include <unistd.h>
 
-#ifndef __cplusplus
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <csignal>
+#include <ctime>
+#include <map>
+#include <memory>
+#include <string>
+#include <thread>
+#include <vector>
 
-#define min(a,b) \
- ({ __typeof__ (a) _a = (a); \
-     __typeof__ (b) _b = (b); \
-   _a < _b ? _a : _b; })
+// keep trying if x gets interrupted by a signal
+#define HANDLE_EINTR(x)                                       \
+  ({                                                          \
+    decltype(x) ret;                                          \
+    int try_cnt = 0;                                          \
+    do {                                                      \
+      ret = (x);                                              \
+    } while (ret == -1 && errno == EINTR && try_cnt++ < 100); \
+    ret;                                                      \
+  })
 
-#define max(a,b) \
- ({ __typeof__ (a) _a = (a); \
-     __typeof__ (b) _b = (b); \
-   _a > _b ? _a : _b; })
-
+#ifndef sighandler_t
+typedef void (*sighandler_t)(int sig);
 #endif
-
-#define clamp(a,b,c) \
- ({ __typeof__ (a) _a = (a); \
-     __typeof__ (b) _b = (b); \
-     __typeof__ (c) _c = (c); \
-   _a < _b ? _b : (_a > _c ? _c : _a); })
-
-#define ARRAYSIZE(x) (sizeof(x)/sizeof(x[0]))
-
-#define ALIGN(x, align) (((x) + (align)-1) & ~((align)-1))
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-// Reads a file into a newly allocated buffer.
-//
-// Returns NULL on failure, otherwise the NULL-terminated file contents.
-// The result must be freed by the caller.
-void* read_file(const char* path, size_t* out_len);
 
 void set_thread_name(const char* name);
 
 int set_realtime_priority(int level);
+int set_core_affinity(std::vector<int> cores);
 
-#ifdef __cplusplus
+namespace util {
+
+// ***** Time helpers *****
+struct tm get_time();
+bool time_valid(struct tm sys_time);
+
+// ***** math helpers *****
+
+// map x from [a1, a2] to [b1, b2]
+template <typename T>
+T map_val(T x, T a1, T a2, T b1, T b2) {
+  x = std::clamp(x, a1, a2);
+  T ra = a2 - a1;
+  T rb = b2 - b1;
+  return (x - a1) * rb / ra + b1;
 }
-#endif
 
+// ***** string helpers *****
+
+template <typename... Args>
+std::string string_format(const std::string& format, Args... args) {
+  size_t size = snprintf(nullptr, 0, format.c_str(), args...) + 1;
+  std::unique_ptr<char[]> buf(new char[size]);
+  snprintf(buf.get(), size, format.c_str(), args...);
+  return std::string(buf.get(), buf.get() + size - 1);
+}
+
+std::string getenv(const char* key, const char* default_val = "");
+int getenv(const char* key, int default_val);
+float getenv(const char* key, float default_val);
+
+std::string tohex(const uint8_t* buf, size_t buf_size);
+std::string hexdump(const std::string& in);
+std::string base_name(std::string const& path);
+std::string dir_name(std::string const& path);
+
+// **** file fhelpers *****
+std::string read_file(const std::string& fn);
+std::map<std::string, std::string> read_files_in_dir(const std::string& path);
+int write_file(const char* path, const void* data, size_t size, int flags = O_WRONLY, mode_t mode = 0664);
+std::string readlink(const std::string& path);
+bool file_exists(const std::string& fn);
+
+inline void sleep_for(const int milliseconds) {
+  std::this_thread::sleep_for(std::chrono::milliseconds(milliseconds));
+}
+
+}  // namespace util
+
+class ExitHandler {
+public:
+  ExitHandler() {
+    std::signal(SIGINT, (sighandler_t)set_do_exit);
+    std::signal(SIGTERM, (sighandler_t)set_do_exit);
+
+#ifndef __APPLE__
+    std::signal(SIGPWR, (sighandler_t)set_do_exit);
 #endif
+  };
+  inline static std::atomic<bool> power_failure = false;
+  inline static std::atomic<int> signal = 0;
+  inline operator bool() { return do_exit; }
+  inline ExitHandler& operator=(bool v) {
+    signal = 0;
+    do_exit = v;
+    return *this;
+  }
+private:
+  static void set_do_exit(int sig) {
+#ifndef __APPLE__
+    power_failure = (sig == SIGPWR);
+#endif
+    signal = sig;
+    do_exit = true;
+  }
+  inline static std::atomic<bool> do_exit = false;
+};
+
+struct unique_fd {
+  unique_fd(int fd = -1) : fd_(fd) {}
+  unique_fd& operator=(unique_fd&& uf) {
+    fd_ = uf.fd_;
+    uf.fd_ = -1;
+    return *this;
+  }
+  ~unique_fd() {
+    if (fd_ != -1) close(fd_);
+  }
+  operator int() const { return fd_; }
+  int fd_;
+};
+
+class FirstOrderFilter {
+public:
+  FirstOrderFilter(float x0, float ts, float dt) {
+    k_ = (dt / ts) / (1.0 + dt / ts);
+    x_ = x0;
+  }
+  inline float update(float x) {
+    x_ = (1. - k_) * x_ + k_ * x;
+    return x_;
+  }
+  inline void reset(float x) { x_ = x; }
+  inline float x(){ return x_; }
+
+private:
+  float x_, k_;
+};
+
+template<typename T>
+void update_max_atomic(std::atomic<T>& max, T const& value) {
+  T prev = max;
+  while(prev < value && !max.compare_exchange_weak(prev, value)) {}
+}

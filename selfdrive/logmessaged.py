@@ -1,40 +1,36 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 import zmq
-from logentries import LogentriesHandler
-from selfdrive.services import service_list
-import selfdrive.messaging as messaging
+from typing import NoReturn
 
-def main(gctx=None):
-  # setup logentries. we forward log messages to it
-  le_token = "e8549616-0798-4d7e-a2ca-2513ae81fa17"
-  le_handler = LogentriesHandler(le_token, use_tls=False, verbose=False)
+import cereal.messaging as messaging
+from common.logging_extra import SwagLogFileFormatter
+from selfdrive.swaglog import get_file_handler
 
-  le_level = 20 #logging.INFO
+
+def main() -> NoReturn:
+  log_handler = get_file_handler()
+  log_handler.setFormatter(SwagLogFileFormatter(None))
+  log_level = 20  # logging.INFO
 
   ctx = zmq.Context().instance()
   sock = ctx.socket(zmq.PULL)
   sock.bind("ipc:///tmp/logmessage")
 
   # and we publish them
-  pub_sock = messaging.pub_sock(service_list['logMessage'].port)
+  pub_sock = messaging.pub_sock('logMessage')
 
   while True:
-    dat = ''.join(sock.recv_multipart())
-
-    # print "RECV", repr(dat)
-
-    levelnum = ord(dat[0])
-    dat = dat[1:]
-
-    if levelnum >= le_level:
-      # push to logentries
-      # TODO: push to athena instead
-      le_handler.emit_raw(dat)
+    dat = b''.join(sock.recv_multipart())
+    level = dat[0]
+    record = dat[1:].decode("utf-8")
+    if level >= log_level:
+      log_handler.emit(record)
 
     # then we publish them
     msg = messaging.new_message()
-    msg.logMessage = dat
+    msg.logMessage = record
     pub_sock.send(msg.to_bytes())
+
 
 if __name__ == "__main__":
   main()

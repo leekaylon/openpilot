@@ -1,39 +1,27 @@
-#ifndef VISIONIMG_H
-#define VISIONIMG_H
+#pragma once
 
-#ifdef QCOM
+#include "cereal/visionipc/visionbuf.h"
+
+#ifdef __APPLE__
+#include <OpenGL/gl3.h>
+#else
 #include <GLES3/gl3.h>
-#include <EGL/egl.h>
-#include <EGL/eglext.h>
 #endif
-
-#include "common/visionbuf.h"
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-#define VISIONIMG_FORMAT_RGB24 1
-
-typedef struct VisionImg {
-  int fd;
-  int format;
-  int width, height, stride;
-  int bpp;
-  size_t size;
-} VisionImg;
-
-void visionimg_compute_aligned_width_and_height(int width, int height, int *aligned_w, int *aligned_h);
-VisionImg visionimg_alloc_rgb24(int width, int height, VisionBuf *out_buf);
 
 #ifdef QCOM
-EGLClientBuffer visionimg_to_egl(const VisionImg *img, void **pph);
-GLuint visionimg_to_gl(const VisionImg *img, EGLImageKHR *pkhr, void **pph);
-void visionimg_destroy_gl(EGLImageKHR khr, void *ph);
+#include <EGL/egl.h>
+#define EGL_EGLEXT_PROTOTYPES
+#include <EGL/eglext.h>
+#undef Status
 #endif
 
-#ifdef __cplusplus
-}  // extern "C"
+class EGLImageTexture {
+ public:
+  EGLImageTexture(const VisionBuf *buf);
+  ~EGLImageTexture();
+  GLuint frame_tex = 0;
+#ifdef QCOM
+  void *private_handle = nullptr;
+  EGLImageKHR img_khr = 0;
 #endif
-
-#endif
+};

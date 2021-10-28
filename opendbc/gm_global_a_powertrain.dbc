@@ -72,8 +72,13 @@ BO_ 201 ECMEngineStatus: 8 K20_ECM
  SG_ Brake_Pressed : 40|1@0+ (1,0) [0|1] "" NEO
  SG_ Standstill : 2|1@0+ (1,0) [0|1] "" NEO
 
-BO_ 209 EBCMBrakePedalTorque: 7 K17_EBCM
- SG_ BrakePedalTorque : 3|12@0+ (1,0) [0|0] ""  NEO
+BO_ 209 EBCMBrakePedalSensors: 7 K17_EBCM
+ SG_ Counter1 : 7|2@0+ (1,0) [0|3] "" XXX
+ SG_ Counter2 : 23|2@0+ (1,0) [0|3] "" XXX
+ SG_ BrakePedalPosition1 : 5|14@0+ (1,0) [0|16383] "" XXX
+ SG_ BrakePedalPosition2 : 21|14@0- (-1,0) [0|16383] "" XXX
+ SG_ BrakeNormalized1 : 39|8@0+ (1,0) [0|255] "" XXX
+ SG_ BrakeNormalized2 : 47|8@0- (-1,0) [0|255] "" XXX
 
 BO_ 241 EBCMBrakePedalPosition: 6 K17_EBCM
  SG_ BrakePedalPosition : 15|8@0+ (1,0) [0|255] ""  NEO
@@ -116,7 +121,7 @@ BO_ 388 PSCMStatus: 8 K43_PSCM
  SG_ LKATorqueDelivered : 18|11@0- (0.01,0) [0|1] "" NEO
  SG_ LKATotalTorqueDelivered : 2|11@0- (0.01,0) [-10.24|10.23] "Nm" NEO
 
-BO_ 417 AcceleratorPedal: 8 XXX
+BO_ 417 AcceleratorPedal: 7 XXX
  SG_ AcceleratorPedal : 55|8@0+ (1,0) [0|0] ""  NEO
 
 BO_ 451 GasAndAcc: 8 XXX
@@ -133,8 +138,8 @@ BO_ 481 ASCMSteeringButton: 7 K124_ASCM
  SG_ DriveModeButton : 39|1@0+ (1,0) [0|1] "" XXX
 
 BO_ 485 PSCMSteeringAngle: 8 K43_PSCM
- SG_ SteeringWheelAngle : 15|16@0- (0.0625,0) [-540|540] "deg"  NEO
- SG_ SteeringWheelRate : 27|12@0- (0.5,0) [-100|100] "deg/s"  NEO
+ SG_ SteeringWheelAngle : 15|16@0- (0.0625,0) [-2047|2047] "deg"  NEO
+ SG_ SteeringWheelRate : 27|12@0- (1,0) [-2047|2047] "deg/s"  NEO
 
 BO_ 489 EBCMVehicleDynamic: 8 K17_EBCM
  SG_ BrakePedalPressed : 6|1@0+ (1,0) [0|0] "" NEO
@@ -163,14 +168,14 @@ BO_ 715 ASCMGasRegenCmd: 8 K124_ASCM
 BO_ 717 ASCM_2CD: 5 K124_ASCM
 
 BO_ 810 TCICOnStarGPSPosition: 8 K73_TCIC
- SG_ GPSLongitude : 39|32@0+ (1,0) [0|0] "milliarcsecond"  NEO
+ SG_ GPSLongitude : 39|32@0+ (1,-2147483648) [0|0] "milliarcsecond"  NEO
  SG_ GPSLatitude : 7|32@0+ (1,0) [0|0] "milliarcsecond"  NEO
 
 BO_ 840 EBCMWheelSpdFront: 4 K17_EBCM
  SG_ FLWheelSpd : 7|16@0+ (0.0311,0) [0|255] "km/h"  NEO
  SG_ FRWheelSpd : 23|16@0+ (0.0311,0) [0|255] "km/h"  NEO
 
-BO_ 842 EBCMWheelSpdRear: 4 K17_EBCM
+BO_ 842 EBCMWheelSpdRear: 5 K17_EBCM
  SG_ RLWheelSpd : 7|16@0+ (0.0311,0) [0|255] "km/h"  NEO
  SG_ RRWheelSpd : 23|16@0+ (0.0311,0) [0|255] "km/h"  NEO
 
@@ -195,7 +200,7 @@ BO_ 1033 ASCMKeepAlive: 7 NEO
 BO_ 1034 ASCM_40A: 7 K124_ASCM
 
 BO_ 1217 ECMEngineCoolantTemp: 8 K20_ECM
- SG_ EngineCoolantTemp : 23|8@0+ (1,-40) [0|0] "°C"  NEO
+ SG_ EngineCoolantTemp : 23|8@0+ (1,-40) [0|0] "C"  NEO
 
 BO_ 1249 VIN_Part2: 8 K20_ECM
  SG_ VINPart2 : 7|64@0+ (1,0) [0|0] ""  NEO
@@ -241,7 +246,7 @@ VAL_ 481 LKAButton 1 "Active" 0 "Inactive" ;
 VAL_ 481 ACCButtons 6 "Cancel" 5 "Main" 3 "Set" 2 "Resume" 1 "None" ;
 VAL_ 481 DriveModeButton 1 "Active" 0 "Inactive" ;
 VAL_ 452 CruiseState 4 "Standstill" 3 "Faulted" 1 "Active" 0 "Off" ;
-VAL_ 309 PRNDL 3 "Reverse" 2 "Drive" 1 "Neutral" 0 "Park" ;
+VAL_ 309 PRNDL 3 "R" 2 "D" 1 "N" 0 "P" ;
 VAL_ 309 ESPButton 1 "Active" 0 "Inactive" ;
 VAL_ 384 LKASteeringCmdActive 1 "Active" 0 "Inactive" ;
 VAL_ 880 ACCLeadCar 1 "Present" 0 "Not Present" ;
