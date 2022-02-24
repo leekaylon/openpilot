@@ -21,6 +21,8 @@ What does this branch change?
 https://github.com/ErichMoraga/openpilot/commits/812
 
 * In a nutshell...
+* Improved SDSU/C-SDSU compatibility
+* AGNOS4 / NEOS 19.1 to ease 0.8.13 transition
 * Don't disengage on gas press
 * Additional IMPREZA FPv1 subsection
 * Toyota ZSS w/ Prius Prime-centric tuning, etc.
