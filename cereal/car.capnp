@@ -105,6 +105,7 @@ struct CarEvent @0x9b1657f34caf3ad3 {
     localizerMalfunction @103;
     highCpuUsage @105;
     cruiseMismatch @106;
+    zssMalfunction @107;
 
     driverMonitorLowAccDEPRECATED @68;
     radarCanErrorDEPRECATED @15;
@@ -152,6 +153,9 @@ struct CarState {
   brake @5 :Float32;      # this is user pedal only
   brakePressed @6 :Bool;  # this is user pedal only
   brakeHoldActive @38 :Bool;
+
+  # ZSS State
+  usingZss @39 :Bool; # is CarState using ZSS
 
   # steering wheel
   steeringAngleDeg @7 :Float32;

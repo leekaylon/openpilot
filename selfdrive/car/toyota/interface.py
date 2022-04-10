@@ -304,6 +304,8 @@ class CarInterface(CarInterfaceBase):
       if ret.vEgo < 0.001:
         # while in standstill, send a user alert
         events.add(EventName.manualRestart)
+    if self.CP.hasZss and not ret.usingZss and ret.cruiseState.enabled:
+      events.add(EventName.zssMalfunction)
 
     ret.events = events.to_msg()
 

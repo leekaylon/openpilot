@@ -390,6 +390,14 @@ EVENTS: Dict[int, Dict[str, Union[Alert, AlertCallbackType]]] = {
       Priority.LOW, VisualAlert.steerRequired, AudibleAlert.prompt, 1.),
   },
 
+  EventName.zssMalfunction: {
+    ET.WARNING: Alert(
+      "ZSS Malfunction - Reengage System to Enable",
+      "",
+      AlertStatus.userPrompt, AlertSize.small,
+      Priority.LOW, VisualAlert.steerRequired, AudibleAlert.prompt, 1.),
+  },
+
   EventName.preDriverDistracted: {
     ET.WARNING: Alert(
       "Pay Attention",
