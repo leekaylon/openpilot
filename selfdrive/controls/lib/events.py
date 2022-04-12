@@ -395,7 +395,7 @@ EVENTS: Dict[int, Dict[str, Union[Alert, AlertCallbackType]]] = {
       "ZSS Malfunction - Reengage System to Enable",
       "",
       AlertStatus.userPrompt, AlertSize.small,
-      Priority.LOW, VisualAlert.steerRequired, AudibleAlert.prompt, 1.),
+      Priority.LOW, VisualAlert.steerRequired, AudibleAlert.prompt, 1., creation_delay=1.5),
   },
 
   EventName.preDriverDistracted: {
