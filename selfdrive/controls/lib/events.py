@@ -392,8 +392,8 @@ EVENTS: Dict[int, Dict[str, Union[Alert, AlertCallbackType]]] = {
 
   EventName.zssMalfunction: {
     ET.WARNING: Alert(
-      "ZSS Malfunction - Reengage System to Enable",
-      "",
+      "ZSS Malfunction per out of tolerance threshold",
+      "Re-engage System to Enable",
       AlertStatus.userPrompt, AlertSize.small,
       Priority.LOW, VisualAlert.steerRequired, AudibleAlert.prompt, 1., creation_delay=1.5),
   },
