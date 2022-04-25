@@ -390,7 +390,7 @@ EVENTS: Dict[int, Dict[str, Union[Alert, AlertCallbackType]]] = {
       Priority.LOW, VisualAlert.steerRequired, AudibleAlert.prompt, 1.),
   },
 
-  EventName.zssMalfunction: {
+  EventName.zssOutOfTolerance: {
     ET.WARNING: Alert(
       "ZSS Malfunction per out of tolerance threshold",
       "Re-engage System to Enable",
