@@ -394,8 +394,8 @@ EVENTS: Dict[int, Dict[str, Union[Alert, AlertCallbackType]]] = {
   # alert from activating while the vehicle is in a turn
   EventName.zssOutOfTolerance: {
     ET.WARNING: Alert(
-      "ZSS Malfunction per out of tolerance threshold",
-      "Re-engage System to Enable",
+      "ZSS out of tolerance",
+      "Re-engage OpenPilot to Enable",
       AlertStatus.userPrompt, AlertSize.small,
       Priority.LOW, VisualAlert.steerRequired, AudibleAlert.prompt, 1., creation_delay=1.5),
   },
