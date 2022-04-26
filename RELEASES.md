@@ -1,3 +1,7 @@
+Version 0.8.12.1 (2022-04-27)
+========================
+ * NEOS 20: improved reliability
+
 Version 0.8.12 (2021-12-15)
 ========================
  * New driving model
