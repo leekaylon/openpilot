@@ -104,15 +104,19 @@ class CarState(CarStateBase):
         else:
           ret.steeringAngleDeg= self.zorro_steer_value
           self.steertype = 3
+          ret.usingZss = True
       else:
         ret.steeringAngleDeg = self.stock_steer_value
         self.steertype = 1
+        ret.usingZss = False
     elif self.accurate_steer_angle_seen:
       ret.steeringAngleDeg = self.torque_steer_value
       self.steertype = 2
+      ret.usingZss = False
     else:
       ret.steeringAngleDeg = self.stock_steer_value
       self.steertype = 1
+      ret.usingZss = False
 
     if (self.count % int(1.0 / DT_CTRL)) == 0:
       cloudlog.info("*** Zorro       *** %s" % self.zorro_steer_value)
