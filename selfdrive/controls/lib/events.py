@@ -396,7 +396,7 @@ EVENTS: Dict[int, Dict[str, Union[Alert, AlertCallbackType]]] = {
     ET.WARNING: Alert(
       "ZSS out of tolerance",
       "Re-engage OpenPilot to Enable",
-      AlertStatus.userPrompt, AlertSize.small,
+      AlertStatus.userPrompt, AlertSize.mid,
       Priority.LOW, VisualAlert.steerRequired, AudibleAlert.prompt, 1., creation_delay=1.5),
   },
 
