@@ -18,7 +18,7 @@ from selfdrive.controls.lib.vehicle_model import ACCELERATION_DUE_TO_GRAVITY
 # move it at all, this is compensated for too.
 
 
-LOW_SPEED_FACTOR = 133
+LOW_SPEED_FACTOR = 200
 JERK_THRESHOLD = 0.2
 
 
