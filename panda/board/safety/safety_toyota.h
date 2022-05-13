@@ -89,12 +89,14 @@ static int toyota_rx_hook(CANPacket_t *to_push) {
       // 5th bit is CRUISE_ACTIVE
       int cruise_engaged = GET_BYTE(to_push, 0) & 0x20U;
       if (!cruise_engaged) {
-        controls_allowed = 0;
+        controls_allowed = 1;
       }
       if (cruise_engaged && !cruise_engaged_prev) {
         controls_allowed = 1;
       }
       cruise_engaged_prev = cruise_engaged;
+      puts("CONTROLS_ALLOWED: ");
+      puth(controls_allowed);
 
       // sample gas pedal
       if (!gas_interceptor_detected) {
@@ -228,16 +230,22 @@ static int toyota_tx_hook(CANPacket_t *to_send) {
       }
 
       // no torque if controls is not allowed
-      if (!controls_allowed && (desired_torque != 0)) {
-        violation = 1;
-      }
+      //if (!controls_allowed && (desired_torque != 0)) {
+      //  violation = 1;
+      //}
 
       // reset to 0 if either controls is not allowed or there's a violation
-      if (violation || !controls_allowed) {
-        desired_torque_last = 0;
-        rt_torque_last = 0;
-        ts_last = ts;
-      }
+      //if (violation || !controls_allowed) {
+      //  if (violation){
+      //    puts("VIOLATION\n");
+      //  }
+      //  if (!controls_allowed){
+      //    puts("CONTOLS NOT ALLOWED\n");
+      //  }
+      //  desired_torque_last = 0;
+      //  rt_torque_last = 0;
+      //  ts_last = ts;
+      //}
 
       if (violation) {
         tx = 0;

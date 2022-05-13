@@ -92,7 +92,7 @@ class CarController():
       lead = lead or CS.out.vEgo < 12.    # at low speed we always assume the lead is present so ACC can be engaged
 
       # Lexus IS uses a different cancellation message
-      if pcm_cancel_cmd and CS.CP.carFingerprint in (CAR.LEXUS_IS, CAR.LEXUS_RC):
+      if pcm_cancel_cmd and CS.CP.carFingerprint in (CAR.LEXUS_IS, CAR.LEXUS_RC, CAR.LEXUS_RC_RETRO):
         can_sends.append(create_acc_cancel_command(self.packer))
       elif CS.CP.openpilotLongitudinalControl:
         can_sends.append(create_accel_command(self.packer, pcm_accel_cmd, pcm_cancel_cmd, self.standstill_req, lead, CS.acc_type))

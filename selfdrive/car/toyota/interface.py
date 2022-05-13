@@ -149,7 +149,7 @@ class CarInterface(CarInterfaceBase):
       ret.mass = 4590. * CV.LB_TO_KG + STD_CARGO_KG
       set_lat_tune(ret.lateralTuning, LatTunes.PID_J)
 
-    elif candidate in (CAR.LEXUS_IS, CAR.LEXUS_RC):
+    elif candidate in (CAR.LEXUS_IS, CAR.LEXUS_RC, CAR.LEXUS_RC_RETRO):
       ret.wheelbase = 2.79908
       ret.steerRatio = 13.3
       tire_stiffness_factor = 0.444
@@ -243,9 +243,8 @@ class CarInterface(CarInterfaceBase):
     self.cp.update_strings(can_strings)
     self.cp_cam.update_strings(can_strings)
 
-    ret = self.CS.update(self.cp, self.cp_cam)
-
-    ret.canValid = self.cp.can_valid and self.cp_cam.can_valid
+    ret = self.CS.update(self.cp, self.cp_cam) 
+    ret.canValid = True #self.cp.can_valid and self.cp_cam.can_valid
     ret.steeringRateLimited = self.CC.steer_rate_limited if self.CC is not None else False
 
     # events
