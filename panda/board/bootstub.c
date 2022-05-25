@@ -1,44 +1,29 @@
 #define BOOTSTUB
 
+#define VERS_TAG 0x53524556
+#define MIN_VERSION 2
+
+// ********************* Includes *********************
 #include "config.h"
-#include "obj/gitversion.h"
 
-#ifdef STM32F4
-  #define PANDA
-  #include "stm32f4xx.h"
-  #include "stm32f4xx_hal_gpio_ex.h"
-#else
-  #include "stm32f2xx.h"
-  #include "stm32f2xx_hal_gpio_ex.h"
-#endif
-
-// default since there's no serial
-void puts(const char *a) {}
-void puth(unsigned int i) {}
-
-#include "libc.h"
-#include "provision.h"
-
-#include "drivers/clock.h"
-#include "drivers/llgpio.h"
-#include "gpio.h"
-
-#include "drivers/spi.h"
+#include "drivers/pwm.h"
 #include "drivers/usb.h"
-//#include "drivers/uart.h"
+
+#include "early_init.h"
+#include "provision.h"
 
 #include "crypto/rsa.h"
 #include "crypto/sha.h"
 
 #include "obj/cert.h"
+#include "obj/gitversion.h"
+#include "flasher.h"
 
-#include "spi_flasher.h"
-
-void __initialize_hardware_early() {
-  early();
+void __initialize_hardware_early(void) {
+  early_initialization();
 }
 
-void fail() {
+void fail(void) {
   soft_flasher_start();
 }
 
@@ -48,14 +33,14 @@ extern void *_app_start[];
 // FIXME: sometimes your panda will fail flashing and will quickly blink a single Green LED
 // BOUNTY: $200 coupon on shop.comma.ai or $100 check.
 
-int main() {
-  __disable_irq();
-  clock_init();
-  detect();
+int main(void) {
+  // Init interrupt table
+  init_interrupts(true);
 
-  if (revision == PANDA_REV_C) {
-    set_usb_power_mode(USB_POWER_CLIENT);
-  }
+  disable_interrupts();
+  clock_init();
+  detect_external_debug_serial();
+  detect_board_type();
 
   if (enter_bootloader_mode == ENTER_SOFTLOADER_MAGIC) {
     enter_bootloader_mode = 0;
@@ -69,6 +54,13 @@ int main() {
   // compute SHA hash
   uint8_t digest[SHA_DIGEST_SIZE];
   SHA_hash(&_app_start[1], len-4, digest);
+
+  // verify version, last bytes in the signed area
+  uint32_t vers[2] = {0};
+  memcpy(&vers, ((void*)&_app_start[0]) + len - sizeof(vers), sizeof(vers));
+  if (vers[0] != VERS_TAG || vers[1] < MIN_VERSION) {
+    goto fail;
+  }
 
   // verify RSA signature
   if (RSA_verify(&release_rsa_key, ((void*)&_app_start[0]) + len, RSANUMBYTES, digest, SHA_DIGEST_SIZE)) {
@@ -88,7 +80,6 @@ fail:
   return 0;
 good:
   // jump to flash
-  ((void(*)()) _app_start[1])();
+  ((void(*)(void)) _app_start[1])();
   return 0;
 }
-
