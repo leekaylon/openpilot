@@ -1,79 +1,95 @@
 """Utilities for reading real time clocks and keeping soft real time constraints."""
+import gc
 import os
 import time
-import platform
-import subprocess
-import multiprocessing
-from cffi import FFI
+from collections import deque
+from typing import Optional, List, Union
 
-# Build and load cython module
-import pyximport
-installer = pyximport.install(inplace=True, build_dir='/tmp')
-from common.clock import monotonic_time, sec_since_boot  # pylint: disable=no-name-in-module, import-error
-pyximport.uninstall(*installer)
-assert monotonic_time
-assert sec_since_boot
+from setproctitle import getproctitle  # pylint: disable=no-name-in-module
+
+from common.clock import sec_since_boot  # pylint: disable=no-name-in-module, import-error
+from system.hardware import PC
 
 
 # time step for each process
 DT_CTRL = 0.01  # controlsd
-DT_PLAN = 0.05  # mpc
 DT_MDL = 0.05  # model
-DT_DMON = 0.1  # driver monitoring
+DT_TRML = 0.5  # thermald and manager
+DT_DMON = 0.05  # driver monitoring
 
 
-ffi = FFI()
-ffi.cdef("long syscall(long number, ...);")
-libc = ffi.dlopen(None)
+class Priority:
+  # CORE 2
+  # - modeld = 55
+  # - camerad = 54
+  CTRL_LOW = 51 # plannerd & radard
+
+  # CORE 3
+  # - boardd = 55
+  CTRL_HIGH = 53
 
 
-def set_realtime_priority(level):
-  if os.getuid() != 0:
-    print("not setting priority, not root")
-    return
-  if platform.machine() == "x86_64":
-    NR_gettid = 186
-  elif platform.machine() == "aarch64":
-    NR_gettid = 178
-  else:
-    raise NotImplementedError
-
-  tid = libc.syscall(NR_gettid)
-  return subprocess.call(['chrt', '-f', '-p', str(level), str(tid)])
+def set_realtime_priority(level: int) -> None:
+  if not PC:
+    os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(level))  # type: ignore[attr-defined] # pylint: disable=no-member
 
 
-class Ratekeeper(object):
-  def __init__(self, rate, print_delay_threshold=0.):
+def set_core_affinity(cores: List[int]) -> None:
+  if not PC:
+    os.sched_setaffinity(0, cores)  # pylint: disable=no-member
+
+
+def config_realtime_process(cores: Union[int, List[int]], priority: int) -> None:
+  gc.disable()
+  set_realtime_priority(priority)
+  c = cores if isinstance(cores, list) else [cores, ]
+  set_core_affinity(c)
+
+
+class Ratekeeper:
+  def __init__(self, rate: float, print_delay_threshold: Optional[float] = 0.0) -> None:
     """Rate in Hz for ratekeeping. print_delay_threshold must be nonnegative."""
     self._interval = 1. / rate
     self._next_frame_time = sec_since_boot() + self._interval
     self._print_delay_threshold = print_delay_threshold
     self._frame = 0
-    self._remaining = 0
-    self._process_name = multiprocessing.current_process().name
+    self._remaining = 0.0
+    self._process_name = getproctitle()
+    self._dts = deque([self._interval], maxlen=100)
+    self._last_monitor_time = sec_since_boot()
 
   @property
-  def frame(self):
+  def frame(self) -> int:
     return self._frame
 
   @property
-  def remaining(self):
+  def remaining(self) -> float:
     return self._remaining
 
+  @property
+  def lagging(self) -> bool:
+    avg_dt = sum(self._dts) / len(self._dts)
+    expected_dt = self._interval * (1 / 0.9)
+    return avg_dt > expected_dt
+
   # Maintain loop rate by calling this at the end of each loop
-  def keep_time(self):
+  def keep_time(self) -> bool:
     lagged = self.monitor_time()
     if self._remaining > 0:
       time.sleep(self._remaining)
     return lagged
 
   # this only monitor the cumulative lag, but does not enforce a rate
-  def monitor_time(self):
+  def monitor_time(self) -> bool:
+    prev = self._last_monitor_time
+    self._last_monitor_time = sec_since_boot()
+    self._dts.append(self._last_monitor_time - prev)
+
     lagged = False
     remaining = self._next_frame_time - sec_since_boot()
     self._next_frame_time += self._interval
     if self._print_delay_threshold is not None and remaining < -self._print_delay_threshold:
-      print("%s lagging by %.2f ms" % (self._process_name, -remaining * 1000))
+      print(f"{self._process_name} lagging by {-remaining * 1000:.2f} ms")
       lagged = True
     self._frame += 1
     self._remaining = remaining

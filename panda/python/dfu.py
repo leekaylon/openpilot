@@ -1,11 +1,14 @@
-from __future__ import print_function
-import os
 import usb1
 import struct
-import time
+import binascii
+from .config import BOOTSTUB_ADDRESS, APP_ADDRESS_H7, APP_ADDRESS_FX, BLOCK_SIZE_H7, BLOCK_SIZE_FX, DEFAULT_H7_BOOTSTUB_FN, DEFAULT_BOOTSTUB_FN
+
+
+MCU_TYPE_F2 = 0
+MCU_TYPE_F4 = 1
+MCU_TYPE_H7 = 2
 
 # *** DFU mode ***
-
 DFU_DNLOAD = 1
 DFU_UPLOAD = 2
 DFU_GETSTATUS = 3
@@ -22,10 +25,10 @@ class PandaDFU(object):
         except Exception:
           continue
         if this_dfu_serial == dfu_serial or dfu_serial is None:
+          self._mcu_type = self.get_mcu_type(device)
           self._handle = device.open()
-          self.legacy = "07*128Kg" in self._handle.getASCIIStringDescriptor(4)
           return
-    raise Exception("failed to open "+dfu_serial)
+    raise Exception("failed to open " + dfu_serial if dfu_serial is not None else "DFU device")
 
   @staticmethod
   def list():
@@ -43,79 +46,80 @@ class PandaDFU(object):
     return dfu_serials
 
   @staticmethod
-  def st_serial_to_dfu_serial(st):
-    if st == None or st == "none":
+  def st_serial_to_dfu_serial(st, mcu_type=MCU_TYPE_F4):
+    if st is None or st == "none":
       return None
-    uid_base = struct.unpack("H"*6, st.decode("hex"))
-    return struct.pack("!HHH", uid_base[1] + uid_base[5], uid_base[0] + uid_base[4] + 0xA, uid_base[3]).encode("hex").upper()
+    uid_base = struct.unpack("H" * 6, bytes.fromhex(st))
+    if mcu_type == MCU_TYPE_H7:
+      return binascii.hexlify(struct.pack("!HHH", uid_base[1] + uid_base[5], uid_base[0] + uid_base[4], uid_base[3])).upper().decode("utf-8")
+    else:
+      return binascii.hexlify(struct.pack("!HHH", uid_base[1] + uid_base[5], uid_base[0] + uid_base[4] + 0xA, uid_base[3])).upper().decode("utf-8")
 
+  # TODO: Find a way to detect F4 vs F2
+  def get_mcu_type(self, dev):
+    return MCU_TYPE_H7 if dev.getbcdDevice() == 512 else MCU_TYPE_F4
 
   def status(self):
     while 1:
-      dat = str(self._handle.controlRead(0x21, DFU_GETSTATUS, 0, 0, 6))
-      if dat[1] == "\x00":
+      dat = self._handle.controlRead(0x21, DFU_GETSTATUS, 0, 0, 6)
+      if dat[1] == 0:
         break
 
   def clear_status(self):
     # Clear status
-    stat = str(self._handle.controlRead(0x21, DFU_GETSTATUS, 0, 0, 6))
-    if stat[4] == "\x0a":
+    stat = self._handle.controlRead(0x21, DFU_GETSTATUS, 0, 0, 6)
+    if stat[4] == 0xa:
       self._handle.controlRead(0x21, DFU_CLRSTATUS, 0, 0, 0)
-    elif stat[4] == "\x09":
-      self._handle.controlWrite(0x21, DFU_ABORT, 0, 0, "")
+    elif stat[4] == 0x9:
+      self._handle.controlWrite(0x21, DFU_ABORT, 0, 0, b"")
       self.status()
     stat = str(self._handle.controlRead(0x21, DFU_GETSTATUS, 0, 0, 6))
 
   def erase(self, address):
-    self._handle.controlWrite(0x21, DFU_DNLOAD, 0, 0, "\x41" + struct.pack("I", address))
+    self._handle.controlWrite(0x21, DFU_DNLOAD, 0, 0, b"\x41" + struct.pack("I", address))
     self.status()
 
   def program(self, address, dat, block_size=None):
-    if block_size == None:
+    if block_size is None:
       block_size = len(dat)
 
     # Set Address Pointer
-    self._handle.controlWrite(0x21, DFU_DNLOAD, 0, 0, "\x21" + struct.pack("I", address))
+    self._handle.controlWrite(0x21, DFU_DNLOAD, 0, 0, b"\x21" + struct.pack("I", address))
     self.status()
 
     # Program
-    dat += "\xFF"*((block_size-len(dat)) % block_size)
-    for i in range(0, len(dat)/block_size):
-      ldat = dat[i*block_size:(i+1)*block_size]
+    dat += b"\xFF" * ((block_size - len(dat)) % block_size)
+    for i in range(0, len(dat) // block_size):
+      ldat = dat[i * block_size:(i + 1) * block_size]
       print("programming %d with length %d" % (i, len(ldat)))
-      self._handle.controlWrite(0x21, DFU_DNLOAD, 2+i, 0, ldat)
+      self._handle.controlWrite(0x21, DFU_DNLOAD, 2 + i, 0, ldat)
       self.status()
 
   def program_bootstub(self, code_bootstub):
     self.clear_status()
-    self.erase(0x8004000)
-    self.erase(0x8000000)
-    self.program(0x8000000, code_bootstub, 0x800)
+    self.erase(BOOTSTUB_ADDRESS)
+    if self._mcu_type == MCU_TYPE_H7:
+      self.erase(APP_ADDRESS_H7)
+      self.program(BOOTSTUB_ADDRESS, code_bootstub, BLOCK_SIZE_H7)
+    else:
+      self.erase(APP_ADDRESS_FX)
+      self.program(BOOTSTUB_ADDRESS, code_bootstub, BLOCK_SIZE_FX)
     self.reset()
 
   def recover(self):
-    from panda import BASEDIR, build_st
-    if self.legacy:
-      fn = "obj/bootstub.comma.bin"
-      print("building legacy bootstub")
-      build_st(fn, "Makefile.legacy")
-    else:
-      fn = "obj/bootstub.panda.bin"
-      print("building panda bootstub")
-      build_st(fn)
-    fn = os.path.join(BASEDIR, "board", fn)
+    fn = DEFAULT_H7_BOOTSTUB_FN if self._mcu_type == MCU_TYPE_H7 else DEFAULT_BOOTSTUB_FN
 
-    with open(fn) as f:
+    with open(fn, "rb") as f:
       code = f.read()
 
     self.program_bootstub(code)
 
   def reset(self):
     # **** Reset ****
-    self._handle.controlWrite(0x21, DFU_DNLOAD, 0, 0, "\x21" + struct.pack("I", 0x8000000))
+    self._handle.controlWrite(0x21, DFU_DNLOAD, 0, 0, b"\x21" + struct.pack("I", BOOTSTUB_ADDRESS))
     self.status()
     try:
-      self._handle.controlWrite(0x21, DFU_DNLOAD, 2, 0, "")
-      stat = str(self._handle.controlRead(0x21, DFU_GETSTATUS, 0, 0, 6))
+      self._handle.controlWrite(0x21, DFU_DNLOAD, 2, 0, b"")
+      _ = str(self._handle.controlRead(0x21, DFU_GETSTATUS, 0, 0, 6))
     except Exception:
       pass
