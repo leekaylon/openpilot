@@ -379,6 +379,16 @@ EVENTS: Dict[int, Dict[str, Union[Alert, AlertCallbackType]]] = {
       Priority.LOW, VisualAlert.steerRequired, AudibleAlert.prompt, 1.),
   },
 
+  # ZSS Out of Tolerance user facing alert, 1.5 seconds delay to prevent the
+  # alert from activating while the vehicle is in a turn
+  EventName.zssOutOfTolerance: {
+    ET.WARNING: Alert(
+      "ZSS out of tolerance",
+      "Re-engage OpenPilot to Enable",
+      AlertStatus.userPrompt, AlertSize.mid,
+      Priority.LOW, VisualAlert.steerRequired, AudibleAlert.prompt, 1., creation_delay=1.5),
+  },
+
   EventName.preDriverDistracted: {
     ET.WARNING: Alert(
       "Pay Attention",
