@@ -741,7 +741,7 @@ FW_VERSIONS = {
     ],
   },
   CAR.CHR_TSS2: {
-    (Ecu.abs, 0x7b0, None): [
+    (Ecu.esp, 0x7b0, None): [
       b'F152610260\x00\x00\x00\x00\x00\x00',
       b'F1526F4270\x00\x00\x00\x00\x00\x00',
     ],
