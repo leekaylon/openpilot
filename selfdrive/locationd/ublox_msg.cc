@@ -1,161 +1,29 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <signal.h>
-#include <unistd.h>
-#include <sched.h>
-#include <sys/time.h>
-#include <sys/cdefs.h>
-#include <sys/types.h>
-#include <sys/time.h>
-#include <assert.h>
-#include <math.h>
-#include <ctime>
-#include <chrono>
-#include <map>
-#include <vector>
-#include <algorithm>
-
-#include <zmq.h>
-#include <capnp/serialize.h>
-#include "cereal/gen/cpp/log.capnp.h"
-
-#include "common/params.h"
-#include "common/swaglog.h"
-#include "common/timing.h"
-
 #include "ublox_msg.h"
 
+#include <unistd.h>
+
+#include <cassert>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
+#include <unordered_map>
+
+#include "common/swaglog.h"
+
+const double gpsPi = 3.1415926535898;
 #define UBLOX_MSG_SIZE(hdr) (*(uint16_t *)&hdr[4])
-#define GET_FIELD_U(w, nb, pos) (((w) >> (pos)) & ((1<<(nb))-1))
 
-namespace ublox {
-
-inline int twos_complement(uint32_t v, uint32_t nb) {
-  int sign = v >> (nb - 1);
-  int value = v;
-  if(sign != 0)
-    value = value - (1 << nb);
-  return value;
-}
-
-inline int GET_FIELD_S(uint32_t w, uint32_t nb, uint32_t pos) {
-  int v = GET_FIELD_U(w, nb, pos);
-  return twos_complement(v, nb);
-}
-
-class EphemerisData {
-  public:
-    EphemerisData(uint8_t svId, subframes_map subframes) {
-      this->svId = svId;
-      int week_no = GET_FIELD_U(subframes[1][2+0], 10, 20);
-      int t_gd = GET_FIELD_S(subframes[1][2+4], 8, 6);
-      int iodc = (GET_FIELD_U(subframes[1][2+0], 2, 6) << 8) | GET_FIELD_U(
-        subframes[1][2+5], 8, 22);
-
-      int t_oc = GET_FIELD_U(subframes[1][2+5], 16, 6);
-      int a_f2 = GET_FIELD_S(subframes[1][2+6], 8, 22);
-      int a_f1 = GET_FIELD_S(subframes[1][2+6], 16, 6);
-      int a_f0 = GET_FIELD_S(subframes[1][2+7], 22, 8);
-
-      int c_rs = GET_FIELD_S(subframes[2][2+0], 16, 6);
-      int delta_n = GET_FIELD_S(subframes[2][2+1], 16, 14);
-      int m_0 = (GET_FIELD_S(subframes[2][2+1], 8, 6) << 24) | GET_FIELD_U(
-        subframes[2][2+2], 24, 6);
-      int c_uc = GET_FIELD_S(subframes[2][2+3], 16, 14);
-      int e = (GET_FIELD_U(subframes[2][2+3], 8, 6) << 24) | GET_FIELD_U(subframes[2][2+4], 24, 6);
-      int c_us = GET_FIELD_S(subframes[2][2+5], 16, 14);
-      uint32_t a_powhalf = (GET_FIELD_U(subframes[2][2+5], 8, 6) << 24) | GET_FIELD_U(
-        subframes[2][2+6], 24, 6);
-      int t_oe = GET_FIELD_U(subframes[2][2+7], 16, 14);
-
-      int c_ic = GET_FIELD_S(subframes[3][2+0], 16, 14);
-      int omega_0 = (GET_FIELD_S(subframes[3][2+0], 8, 6) << 24) | GET_FIELD_U(
-        subframes[3][2+1], 24, 6);
-      int c_is = GET_FIELD_S(subframes[3][2+2], 16, 14);
-      int i_0 = (GET_FIELD_S(subframes[3][2+2], 8, 6) << 24) | GET_FIELD_U(
-        subframes[3][2+3], 24, 6);
-      int c_rc = GET_FIELD_S(subframes[3][2+4], 16, 14);
-      int w = (GET_FIELD_S(subframes[3][2+4], 8, 6) << 24) | GET_FIELD_U(subframes[3][5], 24, 6);
-      int omega_dot = GET_FIELD_S(subframes[3][2+6], 24, 6);
-      int idot = GET_FIELD_S(subframes[3][2+7], 14, 8);
-
-      this->_rsvd1 = GET_FIELD_U(subframes[1][2+1], 23, 6);
-      this->_rsvd2 = GET_FIELD_U(subframes[1][2+2], 24, 6);
-      this->_rsvd3 = GET_FIELD_U(subframes[1][2+3], 24, 6);
-      this->_rsvd4 = GET_FIELD_U(subframes[1][2+4], 16, 14);
-      this->aodo = GET_FIELD_U(subframes[2][2+7], 5, 8);
-
-      double gpsPi = 3.1415926535898;
-
-      // now form variables in radians, meters and seconds etc
-      this->Tgd = t_gd * pow(2, -31);
-      this->A = pow(a_powhalf * pow(2, -19), 2.0);
-      this->cic = c_ic * pow(2, -29);
-      this->cis = c_is * pow(2, -29);
-      this->crc = c_rc * pow(2, -5);
-      this->crs = c_rs * pow(2, -5);
-      this->cuc = c_uc * pow(2, -29);
-      this->cus = c_us * pow(2, -29);
-      this->deltaN = delta_n * pow(2, -43) * gpsPi;
-      this->ecc = e * pow(2, -33);
-      this->i0 = i_0 * pow(2, -31) * gpsPi;
-      this->idot = idot * pow(2, -43) * gpsPi;
-      this->M0 = m_0 * pow(2, -31) * gpsPi;
-      this->omega = w * pow(2, -31) * gpsPi;
-      this->omega_dot = omega_dot * pow(2, -43) * gpsPi;
-      this->omega0 = omega_0 * pow(2, -31) * gpsPi;
-      this->toe = t_oe * pow(2, 4);
-
-      this->toc = t_oc * pow(2, 4);
-      this->gpsWeek = week_no;
-      this->af0 = a_f0 * pow(2, -31);
-      this->af1 = a_f1 * pow(2, -43);
-      this->af2 = a_f2 * pow(2, -55);
-
-      uint32_t iode1 = GET_FIELD_U(subframes[2][2+0], 8, 22);
-      uint32_t iode2 = GET_FIELD_U(subframes[3][2+7], 8, 22);
-      this->valid = (iode1 == iode2) && (iode1 == (iodc & 0xff));
-      this->iode = iode1;
-
-      if (GET_FIELD_U(subframes[4][2+0], 6, 22) == 56 &&
-        GET_FIELD_U(subframes[4][2+0], 2, 28) == 1 &&
-        GET_FIELD_U(subframes[5][2+0], 2, 28) == 1) {
-        double a0 = GET_FIELD_S(subframes[4][2], 8, 14) * pow(2, -30);
-        double a1 = GET_FIELD_S(subframes[4][2], 8, 6) * pow(2, -27);
-        double a2 = GET_FIELD_S(subframes[4][3], 8, 22) * pow(2, -24);
-        double a3 = GET_FIELD_S(subframes[4][3], 8, 14) * pow(2, -24);
-        double b0 = GET_FIELD_S(subframes[4][3], 8, 6) * pow(2, 11);
-        double b1 = GET_FIELD_S(subframes[4][4], 8, 22) * pow(2, 14);
-        double b2 = GET_FIELD_S(subframes[4][4], 8, 14) * pow(2, 16);
-        double b3 = GET_FIELD_S(subframes[4][4], 8, 6) * pow(2, 16);
-        this->ionoAlpha[0] = a0;this->ionoAlpha[1] = a1;this->ionoAlpha[2] = a2;this->ionoAlpha[3] = a3;
-        this->ionoBeta[0] = b0;this->ionoBeta[1] = b1;this->ionoBeta[2] = b2;this->ionoBeta[3] = b3;
-        this->ionoCoeffsValid = true;
-      } else {
-        this->ionoCoeffsValid = false;
-      }
-    }
-    uint16_t svId;
-    double Tgd, A, cic, cis, crc, crs, cuc, cus, deltaN, ecc, i0, idot, M0, omega, omega_dot, omega0, toe, toc;
-    uint32_t gpsWeek, iode, _rsvd1, _rsvd2, _rsvd3, _rsvd4, aodo;
-    double af0, af1, af2;
-    bool valid;
-    double ionoAlpha[4], ionoBeta[4];
-    bool ionoCoeffsValid;
-};
-
-UbloxMsgParser::UbloxMsgParser() :bytes_in_parse_buf(0) {
-  nav_frame_buffer[0U] = std::map<uint8_t, subframes_map>();
-  for(int i = 1;i < 33;i++)
-    nav_frame_buffer[0U][i] = subframes_map();
+inline static bool bit_to_bool(uint8_t val, int shifts) {
+  return (bool)(val & (1 << shifts));
 }
 
 inline int UbloxMsgParser::needed_bytes() {
   // Msg header incomplete?
-  if(bytes_in_parse_buf < UBLOX_HEADER_SIZE)
-    return UBLOX_HEADER_SIZE + UBLOX_CHECKSUM_SIZE - bytes_in_parse_buf;
-  uint16_t needed = UBLOX_MSG_SIZE(msg_parse_buf) + UBLOX_HEADER_SIZE + UBLOX_CHECKSUM_SIZE;
+  if(bytes_in_parse_buf < ublox::UBLOX_HEADER_SIZE)
+    return ublox::UBLOX_HEADER_SIZE + ublox::UBLOX_CHECKSUM_SIZE - bytes_in_parse_buf;
+  uint16_t needed = UBLOX_MSG_SIZE(msg_parse_buf) + ublox::UBLOX_HEADER_SIZE + ublox::UBLOX_CHECKSUM_SIZE;
   // too much data
   if(needed < (uint16_t)bytes_in_parse_buf)
     return -1;
@@ -164,212 +32,464 @@ inline int UbloxMsgParser::needed_bytes() {
 
 inline bool UbloxMsgParser::valid_cheksum() {
   uint8_t ck_a = 0, ck_b = 0;
-  for(int i = 2; i < bytes_in_parse_buf - UBLOX_CHECKSUM_SIZE;i++) {
+  for(int i = 2; i < bytes_in_parse_buf - ublox::UBLOX_CHECKSUM_SIZE;i++) {
     ck_a = (ck_a + msg_parse_buf[i]) & 0xFF;
     ck_b = (ck_b + ck_a) & 0xFF;
   }
   if(ck_a != msg_parse_buf[bytes_in_parse_buf - 2]) {
-    LOGD("Checksum a mismtach: %02X, %02X", ck_a, msg_parse_buf[6]);
+    LOGD("Checksum a mismatch: %02X, %02X", ck_a, msg_parse_buf[6]);
     return false;
   }
   if(ck_b != msg_parse_buf[bytes_in_parse_buf - 1]) {
-    LOGD("Checksum b mismtach: %02X, %02X", ck_b, msg_parse_buf[7]);
+    LOGD("Checksum b mismatch: %02X, %02X", ck_b, msg_parse_buf[7]);
     return false;
   }
   return true;
 }
 
 inline bool UbloxMsgParser::valid() {
-  return bytes_in_parse_buf >= UBLOX_HEADER_SIZE + UBLOX_CHECKSUM_SIZE &&
-    needed_bytes() == 0 &&
-    valid_cheksum();
+  return bytes_in_parse_buf >= ublox::UBLOX_HEADER_SIZE + ublox::UBLOX_CHECKSUM_SIZE &&
+         needed_bytes() == 0 && valid_cheksum();
 }
 
 inline bool UbloxMsgParser::valid_so_far() {
-  if(bytes_in_parse_buf > 0 && msg_parse_buf[0] != PREAMBLE1) {
-    //LOGD("PREAMBLE1 invalid, %02X.", msg_parse_buf[0]);
+  if(bytes_in_parse_buf > 0 && msg_parse_buf[0] != ublox::PREAMBLE1) {
     return false;
   }
-  if(bytes_in_parse_buf > 1 && msg_parse_buf[1] != PREAMBLE2) {
-    //LOGD("PREAMBLE2 invalid, %02X.", msg_parse_buf[1]);
+  if(bytes_in_parse_buf > 1 && msg_parse_buf[1] != ublox::PREAMBLE2) {
     return false;
   }
-  if(needed_bytes() == 0 && !valid())
+  if(needed_bytes() == 0 && !valid()) {
     return false;
+  }
   return true;
 }
 
-kj::Array<capnp::word> UbloxMsgParser::gen_solution() {
-  nav_pvt_msg *msg = (nav_pvt_msg *)&msg_parse_buf[UBLOX_HEADER_SIZE];
-  capnp::MallocMessageBuilder msg_builder;
-  cereal::Event::Builder event = msg_builder.initRoot<cereal::Event>();
-  event.setLogMonoTime(nanos_since_boot());
-  auto gpsLoc = event.initGpsLocationExternal();
-  gpsLoc.setSource(cereal::GpsLocationData::SensorSource::UBLOX);
-  gpsLoc.setFlags(msg->flags);
-  gpsLoc.setLatitude(msg->lat * 1e-07);
-  gpsLoc.setLongitude(msg->lon * 1e-07);
-  gpsLoc.setAltitude(msg->height * 1e-03);
-  gpsLoc.setSpeed(msg->gSpeed * 1e-03);
-  gpsLoc.setBearing(msg->headMot * 1e-5);
-  gpsLoc.setAccuracy(msg->hAcc * 1e-03);
-  std::tm timeinfo = std::tm();
-  timeinfo.tm_year = msg->year - 1900;
-  timeinfo.tm_mon = msg->month - 1;
-  timeinfo.tm_mday = msg->day;
-  timeinfo.tm_hour = msg->hour;
-  timeinfo.tm_min = msg->min;
-  timeinfo.tm_sec = msg->sec;
-  std::time_t utc_tt = timegm(&timeinfo);
-  gpsLoc.setTimestamp(utc_tt * 1e+03 + msg->nano * 1e-06);
-  float f[] = { msg->velN * 1e-03f, msg->velE * 1e-03f, msg->velD * 1e-03f };
-  kj::ArrayPtr<const float> ap(&f[0], sizeof(f) / sizeof(f[0]));
-  gpsLoc.setVNED(ap);
-  gpsLoc.setVerticalAccuracy(msg->vAcc * 1e-03);
-  gpsLoc.setSpeedAccuracy(msg->sAcc * 1e-03);
-  gpsLoc.setBearingAccuracy(msg->headAcc * 1e-05);
-  return capnp::messageToFlatArray(msg_builder);
-}
-
-inline bool bit_to_bool(uint8_t val, int shifts) {
-  return (val & (1 << shifts)) ? true : false;
-}
-
-kj::Array<capnp::word> UbloxMsgParser::gen_raw() {
-  rxm_raw_msg *msg = (rxm_raw_msg *)&msg_parse_buf[UBLOX_HEADER_SIZE];
-  if(bytes_in_parse_buf != (
-    UBLOX_HEADER_SIZE + sizeof(rxm_raw_msg) + msg->numMeas * sizeof(rxm_raw_msg_extra) + UBLOX_CHECKSUM_SIZE
-    )) {
-    LOGD("Invalid measurement size %u, %u, %u, %u", msg->numMeas, bytes_in_parse_buf, sizeof(rxm_raw_msg_extra), sizeof(rxm_raw_msg));
-    return kj::Array<capnp::word>();
+inline uint16_t UbloxMsgParser::get_glonass_year(uint8_t N4, uint16_t Nt) {
+  // convert time to year (conversion from A3.1.3)
+  int J = 0;
+  if (1 <= Nt && Nt <= 366) {
+    J = 1;
+  } else if (367 <= Nt && Nt <= 731) {
+    J = 2;
+  } else if (732 <= Nt && Nt <= 1096) {
+    J = 3;
+  } else if (1097 <= Nt && Nt <= 1461) {
+    J = 4;
   }
-  rxm_raw_msg_extra *measurements = (rxm_raw_msg_extra *)&msg_parse_buf[UBLOX_HEADER_SIZE + sizeof(rxm_raw_msg)];
-  capnp::MallocMessageBuilder msg_builder;
-  cereal::Event::Builder event = msg_builder.initRoot<cereal::Event>();
-  event.setLogMonoTime(nanos_since_boot());
-  auto gnss = event.initUbloxGnss();
-  auto mr = gnss.initMeasurementReport();
-  mr.setRcvTow(msg->rcvTow);
-  mr.setGpsWeek(msg->week);
-  mr.setLeapSeconds(msg->leapS);
-  mr.setGpsWeek(msg->week);
-  auto mb = mr.initMeasurements(msg->numMeas);
-  for(int8_t i = 0; i < msg->numMeas; i++) {
-    mb[i].setSvId(measurements[i].svId);
-    mb[i].setSigId(measurements[i].sigId);
-    mb[i].setPseudorange(measurements[i].prMes);
-    mb[i].setCarrierCycles(measurements[i].cpMes);
-    mb[i].setDoppler(measurements[i].doMes);
-    mb[i].setGnssId(measurements[i].gnssId);
-    mb[i].setGlonassFrequencyIndex(measurements[i].freqId);
-    mb[i].setLocktime(measurements[i].locktime);
-    mb[i].setCno(measurements[i].cno);
-    mb[i].setPseudorangeStdev(0.01*(pow(2, (measurements[i].prStdev & 15)))); // weird scaling, might be wrong
-    mb[i].setCarrierPhaseStdev(0.004*(measurements[i].cpStdev & 15));
-    mb[i].setDopplerStdev(0.002*(pow(2, (measurements[i].doStdev & 15)))); // weird scaling, might be wrong
-    auto ts = mb[i].initTrackingStatus();
-    ts.setPseudorangeValid(bit_to_bool(measurements[i].trkStat, 0));
-    ts.setCarrierPhaseValid(bit_to_bool(measurements[i].trkStat, 1));
-    ts.setHalfCycleValid(bit_to_bool(measurements[i].trkStat, 2));
-    ts.setHalfCycleSubtracted(bit_to_bool(measurements[i].trkStat, 3));
-  }
-
-  mr.setNumMeas(msg->numMeas);
-  auto rs = mr.initReceiverStatus();
-  rs.setLeapSecValid(bit_to_bool(msg->recStat, 0));
-  rs.setClkReset(bit_to_bool(msg->recStat, 2));
-  return capnp::messageToFlatArray(msg_builder);
-}
-
-kj::Array<capnp::word> UbloxMsgParser::gen_nav_data() {
-  rxm_sfrbx_msg *msg = (rxm_sfrbx_msg *)&msg_parse_buf[UBLOX_HEADER_SIZE];
-  if(bytes_in_parse_buf != (
-    UBLOX_HEADER_SIZE + sizeof(rxm_sfrbx_msg) + msg->numWords * sizeof(rxm_sfrbx_msg_extra) + UBLOX_CHECKSUM_SIZE
-    )) {
-    LOGD("Invalid sfrbx words size %u, %u, %u, %u", msg->numWords, bytes_in_parse_buf, sizeof(rxm_raw_msg_extra), sizeof(rxm_raw_msg));
-    return kj::Array<capnp::word>();
-  }
-  rxm_sfrbx_msg_extra *measurements = (rxm_sfrbx_msg_extra *)&msg_parse_buf[UBLOX_HEADER_SIZE + sizeof(rxm_sfrbx_msg)];
-  if(msg->gnssId  == 0) {
-    uint8_t subframeId =  GET_FIELD_U(measurements[1].dwrd, 3, 8);
-    std::vector<uint32_t> words;
-    for(int i = 0; i < msg->numWords;i++)
-      words.push_back(measurements[i].dwrd);
-
-    if(subframeId == 1) {
-      nav_frame_buffer[msg->gnssId][msg->svid] = subframes_map();
-      nav_frame_buffer[msg->gnssId][msg->svid][subframeId] = words;
-    } else if(nav_frame_buffer[msg->gnssId][msg->svid].find(subframeId-1) != nav_frame_buffer[msg->gnssId][msg->svid].end())
-      nav_frame_buffer[msg->gnssId][msg->svid][subframeId] = words;
-    if(nav_frame_buffer[msg->gnssId][msg->svid].size() == 5) {
-      EphemerisData ephem_data(msg->svid, nav_frame_buffer[msg->gnssId][msg->svid]);
-      capnp::MallocMessageBuilder msg_builder;
-      cereal::Event::Builder event = msg_builder.initRoot<cereal::Event>();
-      event.setLogMonoTime(nanos_since_boot());
-      auto gnss = event.initUbloxGnss();
-      auto eph = gnss.initEphemeris();
-      eph.setSvId(ephem_data.svId);
-      eph.setToc(ephem_data.toc);
-      eph.setGpsWeek(ephem_data.gpsWeek);
-      eph.setAf0(ephem_data.af0);
-      eph.setAf1(ephem_data.af1);
-      eph.setAf2(ephem_data.af2);
-      eph.setIode(ephem_data.iode);
-      eph.setCrs(ephem_data.crs);
-      eph.setDeltaN(ephem_data.deltaN);
-      eph.setM0(ephem_data.M0);
-      eph.setCuc(ephem_data.cuc);
-      eph.setEcc(ephem_data.ecc);
-      eph.setCus(ephem_data.cus);
-      eph.setA(ephem_data.A);
-      eph.setToe(ephem_data.toe);
-      eph.setCic(ephem_data.cic);
-      eph.setOmega0(ephem_data.omega0);
-      eph.setCis(ephem_data.cis);
-      eph.setI0(ephem_data.i0);
-      eph.setCrc(ephem_data.crc);
-      eph.setOmega(ephem_data.omega);
-      eph.setOmegaDot(ephem_data.omega_dot);
-      eph.setIDot(ephem_data.idot);
-      eph.setTgd(ephem_data.Tgd);
-      eph.setIonoCoeffsValid(ephem_data.ionoCoeffsValid);
-      if(ephem_data.ionoCoeffsValid) {
-        kj::ArrayPtr<const double> apa(&ephem_data.ionoAlpha[0], sizeof(ephem_data.ionoAlpha) / sizeof(ephem_data.ionoAlpha[0]));
-        eph.setIonoAlpha(apa);
-        kj::ArrayPtr<const double> apb(&ephem_data.ionoBeta[0], sizeof(ephem_data.ionoBeta) / sizeof(ephem_data.ionoBeta[0]));
-        eph.setIonoBeta(apb);
-      } else {
-        eph.setIonoAlpha(kj::ArrayPtr<const double>());
-        eph.setIonoBeta(kj::ArrayPtr<const double>());
-      }
-      return capnp::messageToFlatArray(msg_builder);
-    }
-  }
-  return kj::Array<capnp::word>();
+  uint16_t year = 1996 + 4*(N4 -1) + (J - 1);
+  return year;
 }
 
 bool UbloxMsgParser::add_data(const uint8_t *incoming_data, uint32_t incoming_data_len, size_t &bytes_consumed) {
   int needed = needed_bytes();
   if(needed > 0) {
-    bytes_consumed = min((size_t)needed, incoming_data_len );
+    bytes_consumed = std::min((uint32_t)needed, incoming_data_len );
     // Add data to buffer
     memcpy(msg_parse_buf + bytes_in_parse_buf, incoming_data, bytes_consumed);
     bytes_in_parse_buf += bytes_consumed;
   } else {
     bytes_consumed = incoming_data_len;
   }
+
   // Validate msg format, detect invalid header and invalid checksum.
   while(!valid_so_far() && bytes_in_parse_buf != 0) {
-    //LOGD("Drop corrupt data, remained in buf: %u", bytes_in_parse_buf);
     // Corrupted msg, drop a byte.
     bytes_in_parse_buf -= 1;
     if(bytes_in_parse_buf > 0)
       memmove(&msg_parse_buf[0], &msg_parse_buf[1], bytes_in_parse_buf);
   }
+
   // There is redundant data at the end of buffer, reset the buffer.
-  if(needed_bytes() == -1)
+  if(needed_bytes() == -1) {
     bytes_in_parse_buf = 0;
+  }
   return valid();
 }
 
+
+std::pair<std::string, kj::Array<capnp::word>> UbloxMsgParser::gen_msg() {
+  std::string dat = data();
+  kaitai::kstream stream(dat);
+
+  ubx_t ubx_message(&stream);
+  auto body = ubx_message.body();
+
+  switch (ubx_message.msg_type()) {
+  case 0x0107:
+    return {"gpsLocationExternal", gen_nav_pvt(static_cast<ubx_t::nav_pvt_t*>(body))};
+  case 0x0213: // UBX-RXM-SFRB (Broadcast Navigation Data Subframe)
+    return {"ubloxGnss", gen_rxm_sfrbx(static_cast<ubx_t::rxm_sfrbx_t*>(body))};
+  case 0x0215: // UBX-RXM-RAW (Multi-GNSS Raw Measurement Data)
+    return {"ubloxGnss", gen_rxm_rawx(static_cast<ubx_t::rxm_rawx_t*>(body))};
+  case 0x0a09:
+    return {"ubloxGnss", gen_mon_hw(static_cast<ubx_t::mon_hw_t*>(body))};
+  case 0x0a0b:
+    return {"ubloxGnss", gen_mon_hw2(static_cast<ubx_t::mon_hw2_t*>(body))};
+  default:
+    LOGE("Unknown message type %x", ubx_message.msg_type());
+    return {"ubloxGnss", kj::Array<capnp::word>()};
+  }
+}
+
+
+kj::Array<capnp::word> UbloxMsgParser::gen_nav_pvt(ubx_t::nav_pvt_t *msg) {
+  MessageBuilder msg_builder;
+  auto gpsLoc = msg_builder.initEvent().initGpsLocationExternal();
+  gpsLoc.setSource(cereal::GpsLocationData::SensorSource::UBLOX);
+  gpsLoc.setFlags(msg->flags());
+  gpsLoc.setLatitude(msg->lat() * 1e-07);
+  gpsLoc.setLongitude(msg->lon() * 1e-07);
+  gpsLoc.setAltitude(msg->height() * 1e-03);
+  gpsLoc.setSpeed(msg->g_speed() * 1e-03);
+  gpsLoc.setBearingDeg(msg->head_mot() * 1e-5);
+  gpsLoc.setAccuracy(msg->h_acc() * 1e-03);
+  std::tm timeinfo = std::tm();
+  timeinfo.tm_year = msg->year() - 1900;
+  timeinfo.tm_mon = msg->month() - 1;
+  timeinfo.tm_mday = msg->day();
+  timeinfo.tm_hour = msg->hour();
+  timeinfo.tm_min = msg->min();
+  timeinfo.tm_sec = msg->sec();
+
+  std::time_t utc_tt = timegm(&timeinfo);
+  gpsLoc.setUnixTimestampMillis(utc_tt * 1e+03 + msg->nano() * 1e-06);
+  float f[] = { msg->vel_n() * 1e-03f, msg->vel_e() * 1e-03f, msg->vel_d() * 1e-03f };
+  gpsLoc.setVNED(f);
+  gpsLoc.setVerticalAccuracy(msg->v_acc() * 1e-03);
+  gpsLoc.setSpeedAccuracy(msg->s_acc() * 1e-03);
+  gpsLoc.setBearingAccuracyDeg(msg->head_acc() * 1e-05);
+  return capnp::messageToFlatArray(msg_builder);
+}
+
+kj::Array<capnp::word> UbloxMsgParser::parse_gps_ephemeris(ubx_t::rxm_sfrbx_t *msg) {
+  // GPS subframes are packed into 10x 4 bytes, each containing 3 actual bytes
+  // We will first need to separate the data from the padding and parity
+  auto body = *msg->body();
+  assert(body.size() == 10);
+
+  std::string subframe_data;
+  subframe_data.reserve(30);
+  for (uint32_t word : body) {
+    word = word >> 6; // TODO: Verify parity
+    subframe_data.push_back(word >> 16);
+    subframe_data.push_back(word >> 8);
+    subframe_data.push_back(word >> 0);
+  }
+
+  // Collect subframes in map and parse when we have all the parts
+  {
+    kaitai::kstream stream(subframe_data);
+    gps_t subframe(&stream);
+
+    int subframe_id = subframe.how()->subframe_id();
+    if (subframe_id > 3) {
+      // dont parse almanac subframes
+      return kj::Array<capnp::word>();
+    }
+    gps_subframes[msg->sv_id()][subframe_id] = subframe_data;
+  }
+
+  // publish if subframes 1-3 have been collected
+  if (gps_subframes[msg->sv_id()].size() == 3) {
+    MessageBuilder msg_builder;
+    auto eph = msg_builder.initEvent().initUbloxGnss().initEphemeris();
+    eph.setSvId(msg->sv_id());
+
+    int iode_s2 = 0;
+    int iode_s3 = 0;
+    int iodc_lsb = 0;
+
+    // Subframe 1
+    {
+      kaitai::kstream stream(gps_subframes[msg->sv_id()][1]);
+      gps_t subframe(&stream);
+      gps_t::subframe_1_t* subframe_1 = static_cast<gps_t::subframe_1_t*>(subframe.body());
+
+      eph.setGpsWeek(subframe_1->week_no());
+      eph.setTgd(subframe_1->t_gd() * pow(2, -31));
+      eph.setToc(subframe_1->t_oc() * pow(2, 4));
+      eph.setAf2(subframe_1->af_2() * pow(2, -55));
+      eph.setAf1(subframe_1->af_1() * pow(2, -43));
+      eph.setAf0(subframe_1->af_0() * pow(2, -31));
+      eph.setSvHealth(subframe_1->sv_health());
+      eph.setTowCount(subframe.how()->tow_count());
+      iodc_lsb = subframe_1->iodc_lsb();
+    }
+
+    // Subframe 2
+    {
+      kaitai::kstream stream(gps_subframes[msg->sv_id()][2]);
+      gps_t subframe(&stream);
+      gps_t::subframe_2_t* subframe_2 = static_cast<gps_t::subframe_2_t*>(subframe.body());
+
+      eph.setCrs(subframe_2->c_rs() * pow(2, -5));
+      eph.setDeltaN(subframe_2->delta_n() * pow(2, -43) * gpsPi);
+      eph.setM0(subframe_2->m_0() * pow(2, -31) * gpsPi);
+      eph.setCuc(subframe_2->c_uc() * pow(2, -29));
+      eph.setEcc(subframe_2->e() * pow(2, -33));
+      eph.setCus(subframe_2->c_us() * pow(2, -29));
+      eph.setA(pow(subframe_2->sqrt_a() * pow(2, -19), 2.0));
+      eph.setToe(subframe_2->t_oe() * pow(2, 4));
+      iode_s2 = subframe_2->iode();
+    }
+
+    // Subframe 3
+    {
+      kaitai::kstream stream(gps_subframes[msg->sv_id()][3]);
+      gps_t subframe(&stream);
+      gps_t::subframe_3_t* subframe_3 = static_cast<gps_t::subframe_3_t*>(subframe.body());
+
+      eph.setCic(subframe_3->c_ic() * pow(2, -29));
+      eph.setOmega0(subframe_3->omega_0() * pow(2, -31) * gpsPi);
+      eph.setCis(subframe_3->c_is() * pow(2, -29));
+      eph.setI0(subframe_3->i_0() * pow(2, -31) * gpsPi);
+      eph.setCrc(subframe_3->c_rc() * pow(2, -5));
+      eph.setOmega(subframe_3->omega() * pow(2, -31) * gpsPi);
+      eph.setOmegaDot(subframe_3->omega_dot() * pow(2, -43) * gpsPi);
+      eph.setIode(subframe_3->iode());
+      eph.setIDot(subframe_3->idot() * pow(2, -43) * gpsPi);
+      iode_s3 = subframe_3->iode();
+    }
+
+    gps_subframes[msg->sv_id()].clear();
+    if (iodc_lsb != iode_s2 || iodc_lsb != iode_s3) {
+      // data set cutover, reject ephemeris
+      return kj::Array<capnp::word>();
+    }
+    return capnp::messageToFlatArray(msg_builder);
+  }
+  return kj::Array<capnp::word>();
+}
+
+kj::Array<capnp::word> UbloxMsgParser::parse_glonass_ephemeris(ubx_t::rxm_sfrbx_t *msg) {
+  if (msg->sv_id() == 255) {
+    // data can be decoded before identifying the SV number, in this case 255
+    // is returned, which means "unknown"  (ublox p32)
+    return kj::Array<capnp::word>();
+  }
+
+  auto body = *msg->body();
+  assert(body.size() == 4);
+  {
+    std::string string_data;
+    string_data.reserve(16);
+    for (uint32_t word : body) {
+      for (int i = 3; i >= 0; i--)
+        string_data.push_back(word >> 8*i);
+    }
+
+    kaitai::kstream stream(string_data);
+    glonass_t gl_string(&stream);
+
+    int string_number = gl_string.string_number();
+    if (string_number > 5 || gl_string.idle_chip()) {
+      // dont parse non immediate data, idle_chip == 0
+      return kj::Array<capnp::word>();
+    }
+
+    // immediate data is the same within one superframe
+    if (glonass_superframes[msg->sv_id()] != gl_string.superframe_number()) {
+      glonass_strings[msg->sv_id()].clear();
+      glonass_superframes[msg->sv_id()] = gl_string.superframe_number();
+    }
+    glonass_strings[msg->sv_id()][string_number] = string_data;
+  }
+
+  // publish if strings 1-5 have been collected
+  if (glonass_strings[msg->sv_id()].size() != 5) {
+    return kj::Array<capnp::word>();
+  }
+
+  MessageBuilder msg_builder;
+  auto eph = msg_builder.initEvent().initUbloxGnss().initGlonassEphemeris();
+  eph.setSvId(msg->sv_id());
+  uint16_t current_day = 0;
+
+  // string number 1
+  {
+    kaitai::kstream stream(glonass_strings[msg->sv_id()][1]);
+    glonass_t gl_stream(&stream);
+    glonass_t::string_1_t* data = static_cast<glonass_t::string_1_t*>(gl_stream.data());
+
+    eph.setP1(data->p1());
+    eph.setTk(data->t_k());
+    eph.setXVel(data->x_vel() * pow(2, -20));
+    eph.setXAccel(data->x_accel() * pow(2, -30));
+    eph.setX(data->x() * pow(2, -11));
+  }
+
+  // string number 2
+  {
+    kaitai::kstream stream(glonass_strings[msg->sv_id()][2]);
+    glonass_t gl_stream(&stream);
+    glonass_t::string_2_t* data = static_cast<glonass_t::string_2_t*>(gl_stream.data());
+
+    eph.setSvHealth(data->b_n()>>2); // MSB indicates health
+    eph.setP2(data->p2());
+    eph.setTb(data->t_b());
+    eph.setYVel(data->y_vel() * pow(2, -20));
+    eph.setYAccel(data->y_accel() * pow(2, -30));
+    eph.setY(data->y() * pow(2, -11));
+  }
+
+  // string number 3
+  {
+    kaitai::kstream stream(glonass_strings[msg->sv_id()][3]);
+    glonass_t gl_stream(&stream);
+    glonass_t::string_3_t* data = static_cast<glonass_t::string_3_t*>(gl_stream.data());
+
+    eph.setP3(data->p3());
+    eph.setGammaN(data->gamma_n() * pow(2, -40));
+    eph.setSvHealth(eph.getSvHealth() | data->l_n());
+    eph.setZVel(data->z_vel() * pow(2, -20));
+    eph.setZAccel(data->z_accel() * pow(2, -30));
+    eph.setZ(data->z() * pow(2, -11));
+  }
+
+  // string number 4
+  {
+    kaitai::kstream stream(glonass_strings[msg->sv_id()][4]);
+    glonass_t gl_stream(&stream);
+    glonass_t::string_4_t* data = static_cast<glonass_t::string_4_t*>(gl_stream.data());
+
+    current_day = data->n_t();
+    eph.setTauN(data->tau_n() * pow(2, -30));
+    eph.setDeltaTauN(data->delta_tau_n() * pow(2, -30));
+    eph.setAge(data->e_n());
+    eph.setP4(data->p4());
+    eph.setSvURA(glonass_URA_lookup.at(data->f_t()));
+    if (msg->sv_id() != data->n()) {
+      LOGE("SV_ID != SLOT_NUMBER: %d %d", msg->sv_id(), data->n())
+    }
+    eph.setSvType(data->m());
+  }
+
+  // string number 5
+  {
+    kaitai::kstream stream(glonass_strings[msg->sv_id()][5]);
+    glonass_t gl_stream(&stream);
+    glonass_t::string_5_t* data = static_cast<glonass_t::string_5_t*>(gl_stream.data());
+
+    // string5 parsing is only needed to get the year, this can be removed and
+    // the year can be fetched later in laika (note rollovers and leap year)
+    uint8_t n_4 = data->n_4();
+    uint16_t year = get_glonass_year(n_4, current_day);
+    if (current_day > 1461) {
+      // impossible day within last 4 year, reject ephemeris
+      // TODO: check if this can be detected via hamming code
+      LOGE("INVALID DATA: current day out of range: %d, %d", current_day, n_4);
+      glonass_strings[msg->sv_id()].clear();
+      return kj::Array<capnp::word>();
+    }
+
+    uint16_t last_leap_year = 1996 + 4*(n_4-1);
+    uint16_t days_till_this_year = (year - last_leap_year)*365;
+    if (days_till_this_year != 0) {
+      days_till_this_year++;
+    }
+
+    eph.setYear(year);
+    eph.setDayInYear(current_day - days_till_this_year);
+    eph.setHour((eph.getTk()>>7) & 0x1F);
+    eph.setMinute((eph.getTk()>>1) & 0x3F);
+    eph.setSecond((eph.getTk() & 0x1) * 30);
+  }
+
+  glonass_strings[msg->sv_id()].clear();
+  return capnp::messageToFlatArray(msg_builder);
+}
+
+
+kj::Array<capnp::word> UbloxMsgParser::gen_rxm_sfrbx(ubx_t::rxm_sfrbx_t *msg) {
+  switch (msg->gnss_id()) {
+    case ubx_t::gnss_type_t::GNSS_TYPE_GPS:
+      return parse_gps_ephemeris(msg);
+    case ubx_t::gnss_type_t::GNSS_TYPE_GLONASS:
+      return parse_glonass_ephemeris(msg);
+    default:
+      return kj::Array<capnp::word>();
+  }
+}
+
+kj::Array<capnp::word> UbloxMsgParser::gen_rxm_rawx(ubx_t::rxm_rawx_t *msg) {
+  MessageBuilder msg_builder;
+  auto mr = msg_builder.initEvent().initUbloxGnss().initMeasurementReport();
+  mr.setRcvTow(msg->rcv_tow());
+  mr.setGpsWeek(msg->week());
+  mr.setLeapSeconds(msg->leap_s());
+  mr.setGpsWeek(msg->week());
+
+  auto mb = mr.initMeasurements(msg->num_meas());
+  auto measurements = *msg->measurements();
+  for(int8_t i = 0; i < msg->num_meas(); i++) {
+    mb[i].setSvId(measurements[i]->sv_id());
+    mb[i].setPseudorange(measurements[i]->pr_mes());
+    mb[i].setCarrierCycles(measurements[i]->cp_mes());
+    mb[i].setDoppler(measurements[i]->do_mes());
+    mb[i].setGnssId(measurements[i]->gnss_id());
+    mb[i].setGlonassFrequencyIndex(measurements[i]->freq_id());
+    mb[i].setLocktime(measurements[i]->lock_time());
+    mb[i].setCno(measurements[i]->cno());
+    mb[i].setPseudorangeStdev(0.01 * (pow(2, (measurements[i]->pr_stdev() & 15)))); // weird scaling, might be wrong
+    mb[i].setCarrierPhaseStdev(0.004 * (measurements[i]->cp_stdev() & 15));
+    mb[i].setDopplerStdev(0.002 * (pow(2, (measurements[i]->do_stdev() & 15)))); // weird scaling, might be wrong
+
+    auto ts = mb[i].initTrackingStatus();
+    auto trk_stat = measurements[i]->trk_stat();
+    ts.setPseudorangeValid(bit_to_bool(trk_stat, 0));
+    ts.setCarrierPhaseValid(bit_to_bool(trk_stat, 1));
+    ts.setHalfCycleValid(bit_to_bool(trk_stat, 2));
+    ts.setHalfCycleSubtracted(bit_to_bool(trk_stat, 3));
+  }
+
+  mr.setNumMeas(msg->num_meas());
+  auto rs = mr.initReceiverStatus();
+  rs.setLeapSecValid(bit_to_bool(msg->rec_stat(), 0));
+  rs.setClkReset(bit_to_bool(msg->rec_stat(), 2));
+  return capnp::messageToFlatArray(msg_builder);
+}
+
+kj::Array<capnp::word> UbloxMsgParser::gen_mon_hw(ubx_t::mon_hw_t *msg) {
+  MessageBuilder msg_builder;
+  auto hwStatus = msg_builder.initEvent().initUbloxGnss().initHwStatus();
+  hwStatus.setNoisePerMS(msg->noise_per_ms());
+  hwStatus.setFlags(msg->flags());
+  hwStatus.setAgcCnt(msg->agc_cnt());
+  hwStatus.setAStatus((cereal::UbloxGnss::HwStatus::AntennaSupervisorState) msg->a_status());
+  hwStatus.setAPower((cereal::UbloxGnss::HwStatus::AntennaPowerStatus) msg->a_power());
+  hwStatus.setJamInd(msg->jam_ind());
+  return capnp::messageToFlatArray(msg_builder);
+}
+
+kj::Array<capnp::word> UbloxMsgParser::gen_mon_hw2(ubx_t::mon_hw2_t *msg) {
+  MessageBuilder msg_builder;
+  auto hwStatus = msg_builder.initEvent().initUbloxGnss().initHwStatus2();
+  hwStatus.setOfsI(msg->ofs_i());
+  hwStatus.setMagI(msg->mag_i());
+  hwStatus.setOfsQ(msg->ofs_q());
+  hwStatus.setMagQ(msg->mag_q());
+
+  switch (msg->cfg_source()) {
+    case ubx_t::mon_hw2_t::config_source_t::CONFIG_SOURCE_ROM:
+      hwStatus.setCfgSource(cereal::UbloxGnss::HwStatus2::ConfigSource::ROM);
+      break;
+    case ubx_t::mon_hw2_t::config_source_t::CONFIG_SOURCE_OTP:
+      hwStatus.setCfgSource(cereal::UbloxGnss::HwStatus2::ConfigSource::OTP);
+      break;
+    case ubx_t::mon_hw2_t::config_source_t::CONFIG_SOURCE_CONFIG_PINS:
+      hwStatus.setCfgSource(cereal::UbloxGnss::HwStatus2::ConfigSource::CONFIGPINS);
+      break;
+    case ubx_t::mon_hw2_t::config_source_t::CONFIG_SOURCE_FLASH:
+      hwStatus.setCfgSource(cereal::UbloxGnss::HwStatus2::ConfigSource::FLASH);
+      break;
+    default:
+      hwStatus.setCfgSource(cereal::UbloxGnss::HwStatus2::ConfigSource::UNDEFINED);
+      break;
+  }
+
+  hwStatus.setLowLevCfg(msg->low_lev_cfg());
+  hwStatus.setPostStatus(msg->post_status());
+
+  return capnp::messageToFlatArray(msg_builder);
 }

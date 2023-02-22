@@ -1,48 +1,95 @@
-#!/usr/bin/env python
-"""Run boardd with the BOARDD_LOOPBACK envvar before running this test."""
-
+#!/usr/bin/env python3
 import os
 import random
 import time
+import unittest
+from collections import defaultdict
 
+import cereal.messaging as messaging
+from cereal import car
+from common.params import Params
+from common.spinner import Spinner
+from common.timeout import Timeout
 from selfdrive.boardd.boardd import can_list_to_can_capnp
-from selfdrive.messaging import drain_sock, pub_sock, sub_sock
-from selfdrive.services import service_list
+from selfdrive.car import make_can_msg
+from system.hardware import TICI
+from selfdrive.test.helpers import phone_only, with_processes
 
-def get_test_string():
-  return b"test"+os.urandom(10)
 
-BUS = 0
+class TestBoardd(unittest.TestCase):
 
-def main():
-  rcv = sub_sock(service_list['can'].port) # port 8006
-  snd = pub_sock(service_list['sendcan'].port) # port 8017
-  time.sleep(0.3) # wait to bind before send/recv
+  @classmethod
+  def setUpClass(cls):
+    os.environ['STARTED'] = '1'
+    os.environ['BOARDD_LOOPBACK'] = '1'
+    cls.spinner = Spinner()
 
-  for i in range(10):
-    print("Loop %d" % i)
-    at = random.randint(1024, 2000)
-    st = get_test_string()[0:8]
-    snd.send(can_list_to_can_capnp([[at, 0, st, 0]], msgtype='sendcan').to_bytes())
-    time.sleep(0.1)
-    res = drain_sock(rcv, True)
-    assert len(res) == 1
+  @classmethod
+  def tearDownClass(cls):
+    cls.spinner.close()
 
-    res = res[0].can
-    assert len(res) == 2
+  @phone_only
+  @with_processes(['pandad'])
+  def test_loopback(self):
+    # wait for boardd to init
+    time.sleep(2)
 
-    msg0, msg1 = res
+    with Timeout(60, "boardd didn't start"):
+      sm = messaging.SubMaster(['pandaStates'])
+      while sm.rcv_frame['pandaStates'] < 1 and len(sm['pandaStates']) == 0:
+        sm.update(1000)
 
-    assert msg0.dat == st
-    assert msg1.dat == st
+    num_pandas = len(sm['pandaStates'])
+    if TICI:
+      self.assertGreater(num_pandas, 1, "connect another panda for multipanda tests")
 
-    assert msg0.address == at
-    assert msg1.address == at
+    # boardd blocks on CarVin and CarParams
+    cp = car.CarParams.new_message()
 
-    assert msg0.src == 0x80 | BUS
-    assert msg1.src == BUS
+    safety_config = car.CarParams.SafetyConfig.new_message()
+    safety_config.safetyModel = car.CarParams.SafetyModel.allOutput
+    cp.safetyConfigs = [safety_config]*num_pandas
 
-  print("Success")
+    params = Params()
+    params.put_bool("FirmwareObdQueryDone", True)
+    params.put_bool("ControlsReady", True)
+    params.put("CarParams", cp.to_bytes())
+
+    sendcan = messaging.pub_sock('sendcan')
+    can = messaging.sub_sock('can', conflate=False, timeout=100)
+    time.sleep(0.2)
+
+    n = 200
+    for i in range(n):
+      self.spinner.update(f"boardd loopback {i}/{n}")
+
+      sent_msgs = defaultdict(set)
+      for _ in range(random.randrange(10)):
+        to_send = []
+        for __ in range(random.randrange(100)):
+          bus = random.choice([b for b in range(3*num_pandas) if b % 4 != 3])
+          addr = random.randrange(1, 1<<29)
+          dat = bytes(random.getrandbits(8) for _ in range(random.randrange(1, 9)))
+          sent_msgs[bus].add((addr, dat))
+          to_send.append(make_can_msg(addr, dat, bus))
+        sendcan.send(can_list_to_can_capnp(to_send, msgtype='sendcan'))
+
+      for _ in range(100 * 2):
+        recvd = messaging.drain_sock(can, wait_for_one=True)
+        for msg in recvd:
+          for m in msg.can:
+            if m.src >= 128:
+              key = (m.address, m.dat)
+              assert key in sent_msgs[m.src-128], f"got unexpected msg: {m.src=} {m.address=} {m.dat=}"
+              sent_msgs[m.src-128].discard(key)
+
+        if all(len(v) == 0 for v in sent_msgs.values()):
+          break
+
+      # if a set isn't empty, messages got dropped
+      for bus in sent_msgs.keys():
+        assert not len(sent_msgs[bus]), f"loop {i}: bus {bus} missing {len(sent_msgs[bus])} messages"
+
 
 if __name__ == "__main__":
-  main()
+  unittest.main()
