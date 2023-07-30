@@ -1,3 +1,6 @@
+// WARNING: To stay in compliance with the SIL2 rules laid out in STM UM1840, we should never implement any of the available hardware low power modes.
+// See rule: CoU_3
+
 #define POWER_SAVE_STATUS_DISABLED 0
 #define POWER_SAVE_STATUS_ENABLED 1
 
@@ -9,34 +12,62 @@ void set_power_save_state(int state) {
   if (is_valid_state && (state != power_save_status)) {
     bool enable = false;
     if (state == POWER_SAVE_STATUS_ENABLED) {
-      puts("enable power savings\n");
-      if (is_grey_panda) {
-        char UBLOX_SLEEP_MSG[] = "\xb5\x62\x06\x04\x04\x00\x01\x00\x08\x00\x17\x78";
+      print("enable power savings\n");
+      if (current_board->has_gps) {
+        const char UBLOX_SLEEP_MSG[] = "\xb5\x62\x06\x04\x04\x00\x01\x00\x08\x00\x17\x78";
         uart_ring *ur = get_ring_by_number(1);
-        for (unsigned int i = 0; i < sizeof(UBLOX_SLEEP_MSG) - 1; i++) while (!putc(ur, UBLOX_SLEEP_MSG[i]));
+        for (unsigned int i = 0; i < sizeof(UBLOX_SLEEP_MSG) - 1U; i++) while (!putc(ur, UBLOX_SLEEP_MSG[i]));
       }
+      // Disable CAN interrupts
+      if (harness.status == HARNESS_STATUS_FLIPPED) {
+        llcan_irq_disable(cans[0]);
+      } else {
+        llcan_irq_disable(cans[2]);
+      }
+      llcan_irq_disable(cans[1]);
     } else {
-      puts("disable power savings\n");
-      if (is_grey_panda) {
-        char UBLOX_WAKE_MSG[] = "\xb5\x62\x06\x04\x04\x00\x01\x00\x09\x00\x18\x7a";
+      print("disable power savings\n");
+      if (current_board->has_gps) {
+        const char UBLOX_WAKE_MSG[] = "\xb5\x62\x06\x04\x04\x00\x01\x00\x09\x00\x18\x7a";
         uart_ring *ur = get_ring_by_number(1);
-        for (unsigned int i = 0; i < sizeof(UBLOX_WAKE_MSG) - 1; i++) while (!putc(ur, UBLOX_WAKE_MSG[i]));
+        for (unsigned int i = 0; i < sizeof(UBLOX_WAKE_MSG) - 1U; i++) while (!putc(ur, UBLOX_WAKE_MSG[i]));
       }
+
+      if (harness.status == HARNESS_STATUS_FLIPPED) {
+        llcan_irq_enable(cans[0]);
+      } else {
+        llcan_irq_enable(cans[2]);
+      }
+      llcan_irq_enable(cans[1]);
+
       enable = true;
     }
 
-    // turn on can
-    set_can_enable(CAN1, enable);
-    set_can_enable(CAN2, enable);
-    set_can_enable(CAN3, enable);
+    current_board->enable_can_transceivers(enable);
 
-    // turn on GMLAN
-    set_gpio_output(GPIOB, 14, enable);
-    set_gpio_output(GPIOB, 15, enable);
+    // Switch EPS/GPS
+    if (enable) {
+      current_board->set_gps_mode(GPS_ENABLED);
+    } else {
+      current_board->set_gps_mode(GPS_DISABLED);
+    }
 
-    // turn on LIN
-    set_gpio_output(GPIOB, 7, enable);
-    set_gpio_output(GPIOA, 14, enable);
+    if(current_board->has_hw_gmlan){
+      // turn on GMLAN
+      set_gpio_output(GPIOB, 14, enable);
+      set_gpio_output(GPIOB, 15, enable);
+    }
+
+    if(current_board->has_lin){
+      // turn on LIN
+      set_gpio_output(GPIOB, 7, enable);
+      set_gpio_output(GPIOA, 14, enable);
+    }
+
+    // Switch off IR when in power saving
+    if(!enable){
+      current_board->set_ir_power(0U);
+    }
 
     power_save_status = state;
   }
